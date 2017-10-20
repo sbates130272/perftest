@@ -1976,6 +1976,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			case 'z': user_param->use_rdma_cm = ON; break;
 			case 'R': user_param->work_rdma_cm = ON; break;
 			case 'L': user_param->rdma_cm_bind = ON;
+			  fprintf(stdout, "Hello\n");
 				  GET_STRING(user_param->bindname,strdupa(optarg)); break;
 			case 's': size_len = (int)strlen(optarg);
 				  if (optarg[size_len-1] == 'K') {

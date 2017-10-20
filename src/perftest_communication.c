@@ -900,22 +900,35 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 			return FAILURE;
 		}
 
-		if (res_c != NULL) {
+		fprintf(stdout, "Hello 1 : %d : %s\n", user_param->rdma_cm_bind,
+			user_param->bindname);
+
+		/*		if (res_c != NULL) {
 			if (rdma_bind_addr(ctx->cm_id_control,(struct sockaddr *)&sin_c)) {
 				fprintf(stderr," rdma_bind_addr failed\n");
 				return FAILURE;
 			}
-		}
+			}*/
 
+		if (user_param->rdma_cm_bind){
+		if (rdma_resolve_addr(ctx->cm_id, (struct sockaddr *)&sin_c,(struct sockaddr *)&sin,2000)) {
+			fprintf(stderr, "rdma_resolve_addr failed\n");
+			return FAILURE;
+		}
+		}else{
 		if (rdma_resolve_addr(ctx->cm_id, NULL,(struct sockaddr *)&sin,2000)) {
 			fprintf(stderr, "rdma_resolve_addr failed\n");
 			return FAILURE;
 		}
+		}
+		fprintf(stdout, "Hello 2\n");
 
 		if (rdma_get_cm_event(ctx->cm_channel,&event)) {
 			fprintf(stderr, "rdma_get_cm_events failed\n");
 			return FAILURE;
 		}
+
+		fprintf(stdout, "Hello 3\n");
 
 		if (event->event == RDMA_CM_EVENT_ADDR_ERROR) {
 			num_of_retry--;
@@ -923,15 +936,20 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 			continue;
 		}
 
+		fprintf(stdout, "Hello 4\n");
+
 		if (event->event != RDMA_CM_EVENT_ADDR_RESOLVED) {
 			fprintf(stderr, "unexpected CM event %d\n",event->event);
 			rdma_ack_cm_event(event);
 			return FAILURE;
 		}
+		fprintf(stdout, "Hello 5\n");		
 
 		rdma_ack_cm_event(event);
 		break;
 	}
+	fprintf(stdout, "Hello 6\n");
+
 
 	if (user_param->tos != DEF_TOS) {
 
@@ -948,10 +966,16 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 			return FAILURE;
 		}
 
+				fprintf(stdout, "Hello 7\n");
+
+
 		if (rdma_resolve_route(ctx->cm_id,2000)) {
 			fprintf(stderr, "rdma_resolve_route failed\n");
 			return FAILURE;
 		}
+
+				fprintf(stdout, "Hello 8\n");
+
 
 		if (rdma_get_cm_event(ctx->cm_channel,&event)) {
 			fprintf(stderr, "rdma_get_cm_events failed\n");
@@ -973,6 +997,9 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 		rdma_ack_cm_event(event);
 		break;
 	}
+
+	fprintf(stdout, "Hello 10\n");
+
 
 	ctx->context = ctx->cm_id->verbs;
 	temp = user_param->work_rdma_cm;
@@ -1005,6 +1032,9 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 		return FAILURE;
 	}
 
+	fprintf(stdout, "Hello 20\n");
+
+
 	if (rdma_get_cm_event(ctx->cm_channel,&event)) {
 		fprintf(stderr, "rdma_get_cm_events failed\n");
 		return FAILURE;
@@ -1015,6 +1045,8 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 		rdma_ack_cm_event(event);
                 return FAILURE;
 	}
+
+	fprintf(stdout, "Hello 30\n");
 
 	if (user_param->connection_type == UD) {
 
@@ -1038,6 +1070,8 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 	}
 
 	rdma_ack_cm_event(event);
+	fprintf(stdout, "Hello 40\n");
+
 	return SUCCESS;
 }
 
@@ -1086,9 +1120,19 @@ int rdma_server_connect(struct pingpong_context *ctx,
 	hints.ai_family   = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
 
-	if (check_add_port(&service,user_param->port,user_param->servername,&hints,&res)) {
-		fprintf(stderr, "Problem in resolving basic address and port\n");
-		return FAILURE;
+	fprintf(stdout, "rdma_cm_bind = %d\n", user_param->rdma_cm_bind);
+
+	if (user_param->rdma_cm_bind) {
+		if(check_add_port(&service,user_param->port,user_param->bindname,&hints,&res)) {
+			fprintf(stderr, "Problem in resolving basic bind address and port\n");
+			return FAILURE;
+		}
+	} else {
+
+		if (check_add_port(&service,user_param->port,user_param->servername,&hints,&res)) {
+			fprintf(stderr, "Problem in resolving basic address and port\n");
+			return FAILURE;
+		}
 	}
 
 	if (res->ai_family != PF_INET) {
@@ -1096,6 +1140,11 @@ int rdma_server_connect(struct pingpong_context *ctx,
 	}
 	memcpy(&sin, res->ai_addr, sizeof(sin));
 	sin.sin_port = htons((unsigned short)user_param->port);
+
+	if (user_param->rdma_cm_bind)
+	  fprintf(stdout,"bindname = %s\n", user_param->bindname);
+	else
+	    fprintf(stdout,"servername = %s\n", user_param->servername);
 
 	if (rdma_bind_addr(ctx->cm_id_control,(struct sockaddr *)&sin)) {
 		fprintf(stderr," rdma_bind_addr failed\n");
@@ -1197,6 +1246,8 @@ int create_comm_struct(struct perftest_comm *comm,
 	comm->rdma_params->gid_index2 		= user_param->gid_index2;
 	comm->rdma_params->use_rdma_cm 		= user_param->use_rdma_cm;
 	comm->rdma_params->servername  		= user_param->servername;
+	comm->rdma_params->bindname  		= user_param->bindname;
+	comm->rdma_params->rdma_cm_bind        	= user_param->rdma_cm_bind;
 	comm->rdma_params->machine 	   	= user_param->machine;
 	comm->rdma_params->side		   	= LOCAL;
 	comm->rdma_params->verb		   	= user_param->verb;
