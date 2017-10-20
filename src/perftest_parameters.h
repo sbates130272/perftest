@@ -323,6 +323,7 @@ struct perftest_parameters {
 	int				port;
 	char				*ib_devname;
 	char				*servername;
+	char				*bindname;
 	uint8_t				ib_port;
 	uint8_t				ib_port2;
 	int				mtu;
@@ -413,6 +414,7 @@ struct perftest_parameters {
 	int				use_mcg;
 	int 				use_rdma_cm;
 	int				is_reversed;
+	int				rdma_cm_bind;
 	int				work_rdma_cm;
 	char				*user_mgid;
 	int				buff_size;

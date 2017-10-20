@@ -210,6 +210,7 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 		printf(" report times in cpu cycle units (default microseconds)\n");
 	}
 
+
 	printf("  -d, --ib-dev=<dev> ");
 	printf(" Use IB device <dev> (default first device found)\n");
 
@@ -233,6 +234,11 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 	if (verb == SEND && tst != FS_RATE) {
 		printf("  -g, --mcg ");
 		printf(" Send messages to multicast group with 1 QP attached to it.\n");
+	}
+
+	if (connection_type != RawEth) {
+		printf("  -L, --rdma_cm_bind ");
+		printf(" If -R --rdma_cm is selected use this to perform a rdma_addr_bind (optional).\n");
 	}
 
 	printf("  -h, --help ");
@@ -614,6 +620,7 @@ static void init_perftest_params(struct perftest_parameters *user_param)
 	user_param->use_mcg		= OFF;
 	user_param->use_rdma_cm		= OFF;
 	user_param->work_rdma_cm	= OFF;
+	user_param->rdma_cm_bind	= OFF;
 	user_param->rx_depth		= user_param->verb == SEND ? DEF_RX_SEND : DEF_RX_RDMA;
 	user_param->duplex		= OFF;
 	user_param->noPeak		= OFF;
@@ -1783,6 +1790,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "mcg",		.has_arg = 0, .val = 'g' },
 			{ .name = "comm_rdma_cm",	.has_arg = 0, .val = 'z' },
 			{ .name = "rdma_cm",		.has_arg = 0, .val = 'R' },
+			{ .name = "rdma_cm_bind",	.has_arg = 1, .val = 'L' },
 			{ .name = "tos",		.has_arg = 1, .val = 'T' },
 			{ .name = "help",		.has_arg = 0, .val = 'h' },
 			{ .name = "MGID",		.has_arg = 1, .val = 'M' },
@@ -1872,7 +1880,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "perform_warm_up",	.has_arg = 0, .flag = &perform_warm_up_flag, .val = 1},
 			{ 0 }
 		};
-		c = getopt_long(argc,argv,"w:y:p:d:i:m:s:n:t:u:S:x:c:q:I:o:M:r:Q:A:l:D:f:B:T:E:J:j:K:k:X:aFegzRvhbNVCHUOZP",long_options,NULL);
+		c = getopt_long(argc,argv,"w:y:p:d:i:m:s:n:t:u:S:x:c:q:I:o:M:r:Q:A:l:D:f:B:T:E:J:j:K:k:X:aFegzRL:vhbNVCHUOZP",long_options,NULL);
 
 		if (c == -1)
 			break;
@@ -1967,6 +1975,8 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				  return HELP_EXIT;
 			case 'z': user_param->use_rdma_cm = ON; break;
 			case 'R': user_param->work_rdma_cm = ON; break;
+			case 'L': user_param->rdma_cm_bind = ON;
+				  GET_STRING(user_param->bindname,strdupa(optarg)); break;
 			case 's': size_len = (int)strlen(optarg);
 				  if (optarg[size_len-1] == 'K') {
 					  optarg[size_len-1] = '\0';

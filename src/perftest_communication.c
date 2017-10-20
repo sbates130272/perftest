@@ -860,8 +860,8 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 {
 	char *service;
 	int temp,num_of_retry= NUM_OF_RETRIES;
-	struct sockaddr_in sin;
-	struct addrinfo *res;
+	struct sockaddr_in sin, sin_c;
+	struct addrinfo *res, *res_c = NULL;
 	struct rdma_cm_event *event;
 	struct rdma_conn_param conn_param;
 	struct addrinfo hints;
@@ -871,22 +871,40 @@ int rdma_client_connect(struct pingpong_context *ctx,struct perftest_parameters 
 	hints.ai_socktype = SOCK_STREAM;
 
 	if (check_add_port(&service,user_param->port,user_param->servername,&hints,&res)) {
-		fprintf(stderr, "Problem in resolving basic address and port\n");
+		fprintf(stderr, "Problem in resolving basic server address and port\n");
 		return FAILURE;
 	}
 
-	if (res->ai_family != PF_INET) {
+	if (user_param->rdma_cm_bind) {
+		if(check_add_port(&service,user_param->port,user_param->bindname,&hints,&res_c)) {
+			fprintf(stderr, "Problem in resolving basic bind address and port\n");
+			return FAILURE;
+		}
+	}
+
+	if (res->ai_family != PF_INET || (res_c != NULL && res_c->ai_family != PF_INET)) {
 		return FAILURE;
 	}
 
 	memcpy(&sin, res->ai_addr, sizeof(sin));
 	sin.sin_port = htons((unsigned short)user_param->port);
 
+	if (res_c != NULL) {
+		memcpy(&sin_c, res_c->ai_addr, sizeof(sin_c));
+		sin_c.sin_port = htons((unsigned short)user_param->port);
+	}
 	while (1) {
 
 		if (num_of_retry == 0) {
 			fprintf(stderr, "Received %d times ADDR_ERROR\n",NUM_OF_RETRIES);
 			return FAILURE;
+		}
+
+		if (res_c != NULL) {
+			if (rdma_bind_addr(ctx->cm_id_control,(struct sockaddr *)&sin_c)) {
+				fprintf(stderr," rdma_bind_addr failed\n");
+				return FAILURE;
+			}
 		}
 
 		if (rdma_resolve_addr(ctx->cm_id, NULL,(struct sockaddr *)&sin,2000)) {
