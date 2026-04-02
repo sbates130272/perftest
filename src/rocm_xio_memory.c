@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <dlfcn.h>
 #include <hip/hip_runtime_api.h>
 #include <hsa/hsa.h>
@@ -336,13 +337,18 @@ static int dv_create_cq(struct rocm_xio_dv_state *st,
 	alloc_len = (alloc_len + pgsz - 1) & ~(pgsz - 1);
 
 	void *buf = NULL;
-	hipError_t herr = hipHostMalloc(&buf, alloc_len, hipHostMallocDefault);
-	if (herr != hipSuccess) {
-		fprintf(stderr, "rocm-xio: hipHostMalloc %s: %d\n",
-			label, herr);
+	if (posix_memalign(&buf, pgsz, alloc_len) != 0) {
+		fprintf(stderr, "rocm-xio: posix_memalign %s failed\n",
+			label);
 		return FAILURE;
 	}
 	memset(buf, 0, alloc_len);
+	mlock(buf, alloc_len);
+	hipError_t herr = hipHostRegister(buf, alloc_len,
+					  hipHostRegisterDefault);
+	if (herr != hipSuccess)
+		fprintf(stderr, "rocm-xio: hipHostRegister %s: %s\n",
+			label, hipGetErrorString(herr));
 
 	struct rocm_ernic_dv_umem_attr ua;
 	memset(&ua, 0, sizeof(ua));
@@ -447,13 +453,26 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	sq_len += (uint32_t)pgsz;
 
 	void *sq_ptr = NULL;
-	hipError_t herr = hipHostMalloc(&sq_ptr, sq_len, hipHostMallocDefault);
-	if (herr != hipSuccess) {
-		fprintf(stderr, "rocm-xio: hipHostMalloc SQ: %d\n", herr);
+	if (posix_memalign(&sq_ptr, pgsz, sq_len) != 0) {
+		fprintf(stderr, "rocm-xio: posix_memalign SQ failed\n");
 		free(st);
 		return FAILURE;
 	}
 	memset(sq_ptr, 0, sq_len);
+	mlock(sq_ptr, sq_len);
+	hipError_t herr = hipHostRegister(sq_ptr, sq_len,
+					  hipHostRegisterDefault);
+	if (herr != hipSuccess)
+		fprintf(stderr, "rocm-xio: hipHostRegister SQ: %s\n",
+			hipGetErrorString(herr));
+
+	/* Write marker to page 0 to verify UMEM mapping */
+	volatile int32_t *marker = (volatile int32_t *)sq_ptr;
+	marker[0] = 0xDEAD;
+	marker[1] = 0xBEEF;
+	printf("rocm-xio: SQ page0 marker written: "
+	       "[0]=0x%x [1]=0x%x at %p\n",
+	       marker[0], marker[1], sq_ptr);
 
 	struct rocm_ernic_dv_umem_attr sq_ua;
 	memset(&sq_ua, 0, sizeof(sq_ua));
@@ -481,13 +500,13 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	uint32_t rq_len = (uint32_t)pgsz;
 
 	void *rq_ptr = NULL;
-	herr = hipHostMalloc(&rq_ptr, rq_len, hipHostMallocDefault);
-	if (herr != hipSuccess) {
-		fprintf(stderr, "rocm-xio: hipHostMalloc RQ: %d\n", herr);
+	if (posix_memalign(&rq_ptr, pgsz, rq_len) != 0) {
+		fprintf(stderr, "rocm-xio: posix_memalign RQ failed\n");
 		free(st);
 		return FAILURE;
 	}
 	memset(rq_ptr, 0, rq_len);
+	mlock(rq_ptr, rq_len);
 
 	struct rocm_ernic_dv_umem_attr rq_ua;
 	memset(&rq_ua, 0, sizeof(rq_ua));
@@ -582,6 +601,14 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 		}
 	}
 
+	/* Dump ring state at page 0 of SQ buffer */
+	volatile int32_t *rs = (volatile int32_t *)st->sq_buf;
+	printf("rocm-xio: SQ ring state at %p: "
+	       "[0]=%d [1]=%d [2]=%d [3]=%d\n",
+	       st->sq_buf, rs[0], rs[1], rs[2], rs[3]);
+	printf("rocm-xio: SQ WQE base=%p, prod_tail_ptr=%p\n",
+	       st->sq_wqe_base, (void *)st->sq_ring_prod_tail);
+
 	printf("rocm-xio: DV QP created (QPN=%u, handle=%u, "
 	       "SQ depth=%u, UAR=%p, bridge=%s)\n",
 	       ctx->qp[0]->qp_num, st->qp_handle,
@@ -672,6 +699,18 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 	}
 
 	double elapsed_usec = 0.0;
+
+	volatile int32_t *rs = (volatile int32_t *)st->sq_buf;
+	printf("rocm-xio: pre-launch ring state: "
+	       "[0]=%d [1]=%d [2]=%d [3]=%d\n",
+	       rs[0], rs[1], rs[2], rs[3]);
+	printf("rocm-xio: remote_addr=0x%llx rkey=0x%x "
+	       "lkey=0x%x local_buf=%p size=%u iters=%lu\n",
+	       (unsigned long long)ctx->wr[0].wr.rdma.remote_addr,
+	       ctx->wr[0].wr.rdma.rkey,
+	       ctx->mr[0]->lkey, ctx->buf[0],
+	       (uint32_t)user_param->size,
+	       (unsigned long)user_param->iters);
 
 	user_param->tposted[0] = get_cycles();
 

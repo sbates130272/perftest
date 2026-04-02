@@ -221,8 +221,16 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 	uint16_t ernic_target_bdf,
 	uint32_t uar_bar_offset)
 {
-	uint32_t sq_tail = 0;
-	uint32_t sq_head = 0;
+	/*
+	 * Read the current ring state prod_tail to find
+	 * the initial WQE slot.  The ring state may have
+	 * been advanced during QP state transitions
+	 * (INIT -> RTR -> RTS) by the provider.
+	 */
+	int32_t initial_prod = sq_ring_prod_tail ?
+		*sq_ring_prod_tail : 0;
+	uint32_t sq_tail = ((uint32_t)initial_prod) % sq_depth;
+	uint32_t sq_head = sq_tail;
 	uint64_t local_addr = (uint64_t)local_buf;
 
 	for (uint64_t i = 0; i < iterations; i++) {
@@ -263,8 +271,10 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 	uint32_t uar_bar_offset,
 	uint64_t *gpu_timestamps)
 {
-	uint32_t sq_tail = 0;
-	uint32_t sq_head = 0;
+	int32_t initial_prod = sq_ring_prod_tail ?
+		*sq_ring_prod_tail : 0;
+	uint32_t sq_tail = ((uint32_t)initial_prod) % sq_depth;
+	uint32_t sq_head = sq_tail;
 	uint64_t local_addr = (uint64_t)local_buf;
 
 	for (uint64_t i = 0; i < iterations; i++) {
