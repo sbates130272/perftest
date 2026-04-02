@@ -17,6 +17,7 @@
 #include "mmap_memory.h"
 #include "cuda_memory.h"
 #include "rocm_memory.h"
+#include "rocm_xio_memory.h"
 #include "neuron_memory.h"
 #include "hl_memory.h"
 #include "mlu_memory.h"
@@ -677,6 +678,13 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 			}
 		}
 
+		if (rocm_xio_memory_supported()) {
+			printf("      --use_rocm_xio=<rocm device id>");
+			printf(" GPU-initiated RDMA via rocm-xio DV interface\n");
+			printf("      --pci_mmio_bridge");
+			printf(" Use pci-mmio-bridge for GPU doorbell routing\n");
+		}
+
 		if (neuron_memory_supported()) {
 			printf("      --use_neuron=<logical neuron core id>");
 			printf(" Use selected logical neuron core for NeuronDirect RDMA testing\n");
@@ -953,6 +961,8 @@ static void init_perftest_params(struct perftest_parameters *user_param)
 	user_param->use_cuda_dmabuf	= 0;
 	user_param->use_cuda_pcie_mapping = 0;
 	user_param->use_rocm_dmabuf = 0;
+	user_param->use_rocm_xio = 0;
+	user_param->rocm_xio_pci_mmio_bridge = 0;
 	user_param->use_data_direct	= 0;
 	user_param->cuda_mem_type       = CUDA_MEM_DEVICE;
 	user_param->rocm_device_id	= 0;
@@ -2785,6 +2795,8 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	static int cuda_mem_type_flag = 0;
 	static int use_rocm_flag = 0;
 	static int use_rocm_dmabuf_flag = 0;
+	static int use_rocm_xio_flag = 0;
+	static int pci_mmio_bridge_flag = 0;
 	static int use_neuron_flag = 0;
 	static int use_neuron_dmabuf_flag = 0;
 	static int use_hl_flag = 0;
@@ -2981,6 +2993,8 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "cuda_mem_type",	.has_arg = 1, .flag = &cuda_mem_type_flag, .val = 1},
 			{ .name = "use_rocm",		.has_arg = 1, .flag = &use_rocm_flag, .val = 1},
 			{ .name = "use_rocm_dmabuf",	.has_arg = 0, .flag = &use_rocm_dmabuf_flag, .val = 1},
+			{ .name = "use_rocm_xio",	.has_arg = 1, .flag = &use_rocm_xio_flag, .val = 1},
+			{ .name = "pci_mmio_bridge",	.has_arg = 0, .flag = &pci_mmio_bridge_flag, .val = 1},
 			{ .name = "use_neuron",		.has_arg = 1, .flag = &use_neuron_flag, .val = 1},
 			{ .name = "use_neuron_dmabuf",	.has_arg = 0, .flag = &use_neuron_dmabuf_flag, .val = 1},
 			{ .name = "use_hl",		.has_arg = 1, .flag = &use_hl_flag, .val = 1},
@@ -3439,6 +3453,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				    (use_cuda_dmabuf_flag && !cuda_memory_dmabuf_supported()) ||
 				    (use_rocm_flag && !rocm_memory_supported()) ||
 				    (use_rocm_dmabuf_flag && !rocm_memory_dmabuf_supported()) ||
+				    (use_rocm_xio_flag && !rocm_xio_memory_supported()) ||
 				    (use_neuron_flag && !neuron_memory_supported()) ||
 				    (use_neuron_dmabuf_flag && !neuron_memory_dmabuf_supported()) ||
 				    (use_hl_flag && !hl_memory_supported()) ||
@@ -3458,6 +3473,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 				    (mmap_file_flag || use_mlu_flag || use_neuron_flag || use_hl_flag ||
 						use_ib_dm_dmabuf_flag ||
 					 (use_rocm_flag && user_param->memory_type != MEMORY_ROCM) ||
+					 (use_rocm_xio_flag && user_param->memory_type != MEMORY_ROCM_XIO) ||
 				     ((use_cuda_flag || use_cuda_bus_id_flag) && user_param->memory_type != MEMORY_CUDA))) {
 					fprintf(stderr, " Can't use multiple memory types\n");
 					return FAILURE;
@@ -3527,6 +3543,22 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 						return FAILURE;
 					}
 					use_rocm_dmabuf_flag = 0;
+				}
+				if (use_rocm_xio_flag) {
+					CHECK_VALUE_NON_NEGATIVE(user_param->rocm_device_id,int,"ROCm XIO device",not_int_ptr);
+					user_param->memory_type = MEMORY_ROCM_XIO;
+					user_param->memory_create = rocm_xio_memory_create;
+					user_param->use_rocm_xio = 1;
+					use_rocm_xio_flag = 0;
+				}
+				if (pci_mmio_bridge_flag) {
+					user_param->rocm_xio_pci_mmio_bridge = 1;
+					if (user_param->memory_type != MEMORY_ROCM_XIO) {
+						fprintf(stderr, "pci_mmio_bridge requires --use_rocm_xio\n");
+						free(duplicates_checker);
+						return FAILURE;
+					}
+					pci_mmio_bridge_flag = 0;
 				}
 				if (use_neuron_flag) {
 					user_param->neuron_core_id = strtol(optarg, NULL, 0);
@@ -4365,6 +4397,9 @@ void ctx_print_test_info(struct perftest_parameters *user_param)
 	if (rocm_memory_supported())
 		printf(" Use ROCm memory : %s\n", user_param->memory_type == MEMORY_ROCM ? "ON" : "OFF");
 
+	if (rocm_xio_memory_supported())
+		printf(" Use ROCm XIO   : %s\n", user_param->memory_type == MEMORY_ROCM_XIO ? "ON" : "OFF");
+
 	printf(" Data ex. method : %s",exchange_state[temp]);
 
 	if (user_param->work_rdma_cm) {
@@ -4604,6 +4639,7 @@ static void write_test_info_to_file(int out_json_fds, struct perftest_parameters
 		temp = 1;
 
 	dprintf(out_json_fds, "\"Use_ROCm_memory\": \"%s\",\n", user_param->memory_type == MEMORY_ROCM ? "ON" : "OFF");
+	dprintf(out_json_fds, "\"Use_ROCm_XIO\": \"%s\",\n", user_param->memory_type == MEMORY_ROCM_XIO ? "ON" : "OFF");
 
 	dprintf(out_json_fds, "\"Data_ex_method\": \"%s\"",exchange_state[temp]);
 

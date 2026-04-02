@@ -292,6 +292,20 @@ AC_ARG_ENABLE([rocm_dmabuf],
               [],
               [enable_rocm_dmabuf=no])
 
+AC_ARG_ENABLE([rocm_xio],
+              [AS_HELP_STRING([--enable-rocm-xio],
+                              [Enable GPU-initiated RDMA via rocm-xio])
+              ],
+              [],
+              [enable_rocm_xio=no])
+
+AC_ARG_WITH([rocm_xio],
+            [AS_HELP_STRING([--with-rocm-xio=@<:@rocm-xio path@:>@],
+                            [Path to rocm-xio DV headers])
+            ],
+            [ROCM_XIO_PATH="$with_rocm_xio"],
+            [ROCM_XIO_PATH=""])
+
 AC_ARG_WITH([rocm],
             [AS_HELP_STRING([--with-rocm=@<:@ROCm installation path@:>@],
                             [Provide path to ROCm installation])
@@ -326,6 +340,22 @@ AS_IF([test "x$enable_rocm_dmabuf" = xyes], [
                       [AC_MSG_ERROR([cannot link with -lhsa-runtime64])])
        AC_DEFINE([HAVE_ROCM_DMABUF], [1], [Enable ROCm DMABUF feature])
 	   ])
+
+AS_IF([test "x$enable_rocm_xio" = xyes], [
+       AC_DEFINE([__HIP_PLATFORM_AMD__], [1], [Enable ROCm for XIO])
+       AC_CHECK_HEADERS([hip/hip_runtime_api.h], [],
+                        [AC_MSG_ERROR([rocm-xio requires hip/hip_runtime_api.h])])
+       AC_SEARCH_LIBS([hipFree], [amdhip64], [],
+                      [AC_MSG_ERROR([rocm-xio requires -lamdhip64])])
+       AC_SEARCH_LIBS([dlopen], [dl], [],
+                      [AC_MSG_ERROR([rocm-xio requires libdl])])
+       AC_DEFINE([HAVE_ROCM_XIO], [1], [Enable GPU-initiated RDMA via rocm-xio])
+       AC_CHECK_TOOL([HIPCC], [hipcc], [no])
+       AS_IF([test "x$HIPCC" = "xno"],
+             [AC_MSG_ERROR([rocm-xio requires hipcc compiler])])
+       ])
+
+AM_CONDITIONAL([ROCM_XIO], [test x$enable_rocm_xio = xyes])
 
 AC_TRY_LINK([
 #include <infiniband/verbs.h>],

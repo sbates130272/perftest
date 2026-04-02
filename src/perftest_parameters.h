@@ -459,7 +459,8 @@ enum memory_type {
 	MEMORY_HL,
 	MEMORY_MLU,
 	MEMORY_OPENCL,
-	MEMORY_DM
+	MEMORY_DM,
+	MEMORY_ROCM_XIO
 };
 
 enum cuda_mem_type {
@@ -616,6 +617,8 @@ struct perftest_parameters {
 	int				use_data_direct;
 	int				rocm_device_id;
 	int				use_rocm_dmabuf;
+	int				use_rocm_xio;
+	int				rocm_xio_pci_mmio_bridge;
 	int				neuron_core_id;
 	int				use_neuron_dmabuf;
 	char				*hl_device_bus_id;

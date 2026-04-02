@@ -28,6 +28,7 @@
 #endif
 
 #include "perftest_resources.h"
+#include "rocm_xio_memory.h"
 #include "raw_ethernet_resources.h"
 #include "host_validation.h"
 
@@ -2690,6 +2691,14 @@ int ctx_init(struct pingpong_context *ctx, struct perftest_parameters *user_para
 	if (create_mr(ctx, user_param)) {
 		fprintf(stderr, "Failed to create MR\n");
 		goto dmah;
+	}
+
+	if (user_param->memory_type == MEMORY_ROCM_XIO) {
+		if (rocm_xio_create_dv_resources(ctx, user_param)) {
+			fprintf(stderr, "Failed to create rocm-xio DV resources\n");
+			goto mr;
+		}
+		return SUCCESS;
 	}
 
 	if (create_cqs(ctx, user_param)) {

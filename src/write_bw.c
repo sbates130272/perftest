@@ -42,6 +42,7 @@
 #include "perftest_parameters.h"
 #include "perftest_resources.h"
 #include "perftest_communication.h"
+#include "rocm_xio_memory.h"
 
 /******************************************************************************
  ******************************************************************************/
@@ -383,7 +384,12 @@ int main(int argc, char *argv[])
 
 			} else if (user_param.machine == CLIENT || user_param.verb != WRITE_IMM) {
 
-				if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
+				if (user_param.use_rocm_xio) {
+					if (rocm_xio_run_iter_bw(&ctx, &user_param)) {
+						fprintf(stderr," Failed to complete rocm_xio_run_iter_bw\n");
+						goto destroy_context;
+					}
+				} else if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
 					fprintf(stderr," Failed to complete run_iter_bw function successfully\n");
 					goto destroy_context;
 				}
@@ -455,7 +461,12 @@ int main(int argc, char *argv[])
 
 		} else if (user_param.machine == CLIENT || user_param.verb != WRITE_IMM) {
 
-			if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
+			if (user_param.use_rocm_xio) {
+				if (rocm_xio_run_iter_bw(&ctx, &user_param)) {
+					fprintf(stderr," Failed to complete rocm_xio_run_iter_bw\n");
+					goto destroy_context;
+				}
+			} else if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
 				fprintf(stderr," Failed to complete run_iter_bw function successfully\n");
 				goto destroy_context;
 			}

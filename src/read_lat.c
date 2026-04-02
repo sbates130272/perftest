@@ -47,6 +47,7 @@
 #include "perftest_resources.h"
 #include "perftest_parameters.h"
 #include "perftest_communication.h"
+#include "rocm_xio_memory.h"
 
 /******************************************************************************
  *
@@ -309,7 +310,12 @@ int main(int argc, char *argv[])
 	if (user_param.test_method == RUN_ALL) {
 		for (i = 1; i < 24 ; ++i) {
 			user_param.size = (uint64_t)1 << i;
-			if(run_iter_lat(&ctx,&user_param)) {
+			if (user_param.use_rocm_xio) {
+				if (rocm_xio_run_iter_lat_write(&ctx, &user_param)) {
+					error = 17;
+					goto free_mem;
+				}
+			} else if(run_iter_lat(&ctx,&user_param)) {
 				error = 17;
 				goto free_mem;
 			}
@@ -317,7 +323,12 @@ int main(int argc, char *argv[])
 			user_param.test_type == ITERATIONS ? print_report_lat(&user_param) : print_report_lat_duration(&user_param);
 		}
 	} else {
-		if(run_iter_lat(&ctx,&user_param)){
+		if (user_param.use_rocm_xio) {
+			if (rocm_xio_run_iter_lat_write(&ctx, &user_param)) {
+				error = 17;
+				goto free_mem;
+			}
+		} else if(run_iter_lat(&ctx,&user_param)){
 			error = 17;
 			goto free_mem;
 		}

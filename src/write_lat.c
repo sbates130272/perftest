@@ -47,6 +47,7 @@
 #include "perftest_parameters.h"
 #include "perftest_resources.h"
 #include "perftest_communication.h"
+#include "rocm_xio_memory.h"
 
 /******************************************************************************
  *
@@ -303,7 +304,12 @@ int main(int argc, char *argv[])
 					goto free_mem;
 				}
 			} else {
-				if(run_iter_lat_write(&ctx,&user_param)) {
+				if (user_param.use_rocm_xio) {
+					if (rocm_xio_run_iter_lat_write(&ctx, &user_param)) {
+						fprintf(stderr,"rocm_xio_run_iter_lat_write failed\n");
+						goto free_mem;
+					}
+				} else if(run_iter_lat_write(&ctx,&user_param)) {
 					fprintf(stderr,"Test exited with Error\n");
 					goto free_mem;
 				}
@@ -315,15 +321,10 @@ int main(int argc, char *argv[])
 	} else {
 
 		if (user_param.verb == WRITE_IMM) {
-			/* Post recevie recv_wqes fo current message size */
 			if (ctx_set_recv_wqes(&ctx,&user_param)) {
 				fprintf(stderr," Failed to post receive recv_wqes\n");
 				goto free_mem;
 			}
-
-			/* Sync between the client and server so the client won't send packets
-			* Before the server has posted his receive wqes (in UC/UD it will result in a deadlock).
-			*/
 
 			if (ctx_hand_shake(&user_comm,my_dest,rem_dest)) {
 				fprintf(stderr,"Failed to exchange data between server and clients\n");
@@ -335,7 +336,12 @@ int main(int argc, char *argv[])
 				goto free_mem;
 			}
 		} else {
-			if(run_iter_lat_write(&ctx,&user_param)) {
+			if (user_param.use_rocm_xio) {
+				if (rocm_xio_run_iter_lat_write(&ctx, &user_param)) {
+					fprintf(stderr,"rocm_xio_run_iter_lat_write failed\n");
+					goto free_mem;
+				}
+			} else if(run_iter_lat_write(&ctx,&user_param)) {
 				fprintf(stderr,"Test exited with Error\n");
 				goto free_mem;
 			}
