@@ -19,6 +19,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 #include <hip/hip_runtime_api.h>
 #include <hsa/hsa.h>
@@ -580,13 +581,29 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 		}
 	}
 
-	/* Dump ring state at page 0 of SQ buffer */
+	/* Dump ring state and physical address */
 	volatile int32_t *rs = (volatile int32_t *)st->sq_buf;
 	printf("rocm-xio: SQ ring state at %p: "
 	       "[0]=%d [1]=%d [2]=%d [3]=%d\n",
 	       st->sq_buf, rs[0], rs[1], rs[2], rs[3]);
 	printf("rocm-xio: SQ WQE base=%p, prod_tail_ptr=%p\n",
 	       st->sq_wqe_base, (void *)st->sq_ring_prod_tail);
+	{
+		int pm = open("/proc/self/pagemap", O_RDONLY);
+		if (pm >= 0) {
+			uint64_t vpn = (uint64_t)st->sq_buf / 4096;
+			uint64_t entry = 0;
+			if (pread(pm, &entry, 8, vpn * 8) == 8) {
+				uint64_t pfn = entry & 0x7FFFFFFFFFFFFFULL;
+				printf("rocm-xio: SQ page0 phys=0x%llx "
+				       "(pfn=0x%llx present=%d)\n",
+				       (unsigned long long)(pfn * 4096),
+				       (unsigned long long)pfn,
+				       (int)((entry >> 63) & 1));
+			}
+			close(pm);
+		}
+	}
 
 	printf("rocm-xio: DV QP created (QPN=%u, handle=%u, "
 	       "SQ depth=%u, UAR=%p, bridge=%s)\n",
