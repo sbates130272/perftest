@@ -150,13 +150,13 @@ endif
 
 if ROCM_XIO
 
-HIPCC_FLAGS = -DHAVE_CONFIG_H $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) -fPIC -std=c++17
+HIPCC_FLAGS = -DHAVE_CONFIG_H $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) -fPIC -std=c++17 @ROCM_XIO_CFLAGS@
 
 src/rocm_xio_kernels.hip.o: src/rocm_xio_kernels.hip
 	$(HIPCC) $(HIPCC_FLAGS) -o $@ -c $<
 
 ROCM_XIO_KERNEL_OBJ = src/rocm_xio_kernels.hip.o
-LIBROCM_XIO_KERNEL = -lamdhip64 -ldl
+LIBROCM_XIO_KERNEL = @ROCM_XIO_LIBS@ -lamdhip64 -ldl
 
 else
 ROCM_XIO_KERNEL_OBJ =

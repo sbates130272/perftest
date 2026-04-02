@@ -353,6 +353,17 @@ AS_IF([test "x$enable_rocm_xio" = xyes], [
        AC_CHECK_TOOL([HIPCC], [hipcc], [no])
        AS_IF([test "x$HIPCC" = "xno"],
              [AC_MSG_ERROR([rocm-xio requires hipcc compiler])])
+       AC_SEARCH_LIBS([hsa_memory_free], [hsa-runtime64], [],
+                      [AC_MSG_ERROR([rocm-xio requires -lhsa-runtime64])])
+       AS_IF([test -n "$ROCM_XIO_PATH"], [
+              ROCM_XIO_CFLAGS="-I$ROCM_XIO_PATH/src/include"
+              ROCM_XIO_LIBS="$ROCM_XIO_PATH/build/librocm-xio.a -lhsa-runtime64 -lhsakmt -lstdc++"
+       ], [
+              ROCM_XIO_CFLAGS="-I/opt/rocm-xio/src/include"
+              ROCM_XIO_LIBS="/opt/rocm-xio/build/librocm-xio.a -lhsa-runtime64 -lhsakmt -lstdc++"
+       ])
+       AC_SUBST([ROCM_XIO_CFLAGS])
+       AC_SUBST([ROCM_XIO_LIBS])
        ])
 
 AM_CONDITIONAL([ROCM_XIO], [test x$enable_rocm_xio = xyes])

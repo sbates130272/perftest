@@ -6,30 +6,47 @@
  * Writes WQEs, rings doorbells, and polls CQ
  * completions matching the PVRDMA ABI used by
  * the rocm-ernic emulated device.
- *
- * WQE layout and doorbell encoding match
- * rocm-xio's ernic-queue-pair.hip exactly.
  */
 
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <string.h>
+#include <cstdio>
+#include <unistd.h>
 
-/* PVRDMA WQE opcodes */
 #define ERNIC_WR_RDMA_WRITE 0
 #define ERNIC_WR_RDMA_READ  4
-
-/* Send flags */
 #define ERNIC_SEND_SIGNALED (1u << 1)
+#define ERNIC_UAR_QP_SEND   (1u << 30)
 
-/* UAR doorbell encoding */
-#define ERNIC_UAR_QP_SEND (1u << 30)
+#define PCI_MMIO_BRIDGE_CMD_WRITE     1
+#define PCI_MMIO_BRIDGE_STATUS_PENDING 0
 
 /*
- * WQE header: 80 bytes matching pvrdma_sq_wqe_hdr.
- * Must be kept in sync with the rocm-ernic provider
- * and emulator.
+ * pci-mmio-bridge structures matching QEMU device
+ * and rocm-xio xio.h.  Inlined here so the GPU
+ * linker doesn't need librocm-xio.a device code.
  */
+struct pci_mmio_bridge_ring_meta {
+	uint32_t producer_idx;
+	uint32_t consumer_idx;
+	uint32_t queue_depth;
+	uint32_t reserved;
+} __attribute__((packed));
+
+struct pci_mmio_bridge_command {
+	uint16_t target_bdf;
+	uint8_t target_bar;
+	uint8_t reserved1;
+	uint32_t offset;
+	uint64_t value;
+	uint8_t command;
+	uint8_t size;
+	uint8_t status;
+	uint8_t reserved2;
+	uint32_t sequence;
+} __attribute__((packed));
+
 struct ernic_wqe_hdr {
 	uint64_t wr_id;
 	uint32_t num_sge;
@@ -60,9 +77,38 @@ struct ernic_sge {
 };
 
 /*
- * Write one RDMA Write WQE into the SQ at the given
- * tail index, then advance the tail.
+ * Inline bridge command -- matches
+ * xio::genPciMmioBridgeCmd exactly.
  */
+__device__ static void gen_bridge_cmd(
+	void *shadow, uint16_t target_bdf,
+	uint8_t target_bar, uint32_t offset,
+	uint64_t value, uint8_t command,
+	uint8_t size)
+{
+	volatile struct pci_mmio_bridge_ring_meta *meta =
+		(volatile struct pci_mmio_bridge_ring_meta *)shadow;
+	uint32_t slot = meta->producer_idx % meta->queue_depth;
+	volatile struct pci_mmio_bridge_command *cmd =
+		(volatile struct pci_mmio_bridge_command *)(
+			(volatile uint8_t *)shadow +
+			sizeof(struct pci_mmio_bridge_ring_meta) +
+			slot * sizeof(struct pci_mmio_bridge_command));
+	cmd->target_bdf = target_bdf;
+	cmd->target_bar = target_bar;
+	cmd->reserved1 = 0;
+	cmd->offset = offset;
+	cmd->value = value;
+	cmd->command = command;
+	cmd->size = size;
+	cmd->status = PCI_MMIO_BRIDGE_STATUS_PENDING;
+	cmd->reserved2 = 0;
+	cmd->sequence = slot;
+	__threadfence_system();
+	meta->producer_idx = meta->producer_idx + 1;
+	__threadfence_system();
+}
+
 __device__ static void write_rdma_wqe(
 	void *sq_base, uint32_t sq_wqe_size,
 	uint32_t *tail, uint32_t sq_depth,
@@ -93,20 +139,15 @@ __device__ static void write_rdma_wqe(
 	*tail = (*tail + 1) % sq_depth;
 }
 
-/*
- * Ring the UAR doorbell via direct MMIO write.
- * The pci-mmio-bridge path is not implemented here;
- * it requires the bridge shadow buffer and BDF which
- * would add significant complexity.  For Phase 1 we
- * use the direct UAR path (which works when the GPU
- * can reach the UAR page via hipHostRegister).
- */
 __device__ static void ring_doorbell(
 	volatile int32_t *sq_ring_prod_tail,
 	volatile uint32_t *uar_ptr,
 	uint32_t uar_qp_offset,
 	uint32_t qp_handle,
-	uint32_t sq_depth)
+	uint32_t sq_depth,
+	void *mmio_bridge_shadow,
+	uint16_t ernic_target_bdf,
+	uint32_t uar_bar_offset)
 {
 	if (sq_ring_prod_tail) {
 		int32_t cur = *sq_ring_prod_tail;
@@ -118,7 +159,12 @@ __device__ static void ring_doorbell(
 	uint32_t val = (qp_handle & 0x00FFFFFF) | ERNIC_UAR_QP_SEND;
 	__threadfence_system();
 
-	if (uar_ptr) {
+	if (mmio_bridge_shadow) {
+		gen_bridge_cmd(mmio_bridge_shadow,
+			       ernic_target_bdf, 2,
+			       uar_bar_offset, val,
+			       PCI_MMIO_BRIDGE_CMD_WRITE, 4);
+	} else if (uar_ptr) {
 		volatile uint32_t *db = uar_ptr + (uar_qp_offset / 4);
 		__hip_atomic_store(
 			const_cast<uint32_t *>(db), val,
@@ -127,14 +173,6 @@ __device__ static void ring_doorbell(
 	}
 }
 
-/*
- * Poll the CQ for a completion.  The CQ ring state
- * lives at the start of the CQ buffer as PvrdmaRingState:
- *   [0] = SQ prod_tail (unused here)
- *   [1] = SQ cons_head (unused here)
- *   [2] = CQ prod_tail (server-written)
- *   [3] = CQ cons_head (GPU-advanced)
- */
 __device__ static void poll_cq_until(
 	void *cq_base, uint32_t cq_depth,
 	uint32_t sq_depth,
@@ -169,11 +207,6 @@ __device__ static void poll_cq_until(
 	}
 }
 
-/*
- * Bandwidth kernel: post `iterations` RDMA Write
- * WQEs as fast as possible, each followed by a
- * doorbell ring.  Poll for all completions at end.
- */
 __global__ void rocm_xio_write_bw_gpu_kernel(
 	void *sq_base, void *cq_base,
 	volatile int32_t *sq_ring_prod_tail,
@@ -183,7 +216,10 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 	uint32_t lkey, void *local_buf,
 	uint32_t msg_size, uint64_t iterations,
 	uint32_t sq_depth, uint32_t sq_wqe_size,
-	uint32_t qp_handle, uint32_t cq_depth)
+	uint32_t qp_handle, uint32_t cq_depth,
+	void *mmio_bridge_shadow,
+	uint16_t ernic_target_bdf,
+	uint32_t uar_bar_offset)
 {
 	uint32_t sq_tail = 0;
 	uint32_t sq_head = 0;
@@ -200,9 +236,11 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 			       msg_size);
 
 		ring_doorbell(sq_ring_prod_tail,
-			      gpu_uar_ptr,
-			      uar_qp_offset,
-			      qp_handle, sq_depth);
+			      gpu_uar_ptr, uar_qp_offset,
+			      qp_handle, sq_depth,
+			      mmio_bridge_shadow,
+			      ernic_target_bdf,
+			      uar_bar_offset);
 	}
 
 	poll_cq_until(cq_base, cq_depth,
@@ -210,11 +248,6 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 		      sq_depth);
 }
 
-/*
- * Latency kernel: post one WQE, wait for completion,
- * record per-iteration timing.  Runs on a single
- * thread.
- */
 __global__ void rocm_xio_write_lat_gpu_kernel(
 	void *sq_base, void *cq_base,
 	volatile int32_t *sq_ring_prod_tail,
@@ -225,6 +258,9 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 	uint32_t msg_size, uint64_t iterations,
 	uint32_t sq_depth, uint32_t sq_wqe_size,
 	uint32_t qp_handle, uint32_t cq_depth,
+	void *mmio_bridge_shadow,
+	uint16_t ernic_target_bdf,
+	uint32_t uar_bar_offset,
 	uint64_t *gpu_timestamps)
 {
 	uint32_t sq_tail = 0;
@@ -244,9 +280,11 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 			       msg_size);
 
 		ring_doorbell(sq_ring_prod_tail,
-			      gpu_uar_ptr,
-			      uar_qp_offset,
-			      qp_handle, sq_depth);
+			      gpu_uar_ptr, uar_qp_offset,
+			      qp_handle, sq_depth,
+			      mmio_bridge_shadow,
+			      ernic_target_bdf,
+			      uar_bar_offset);
 
 		poll_cq_until(cq_base, cq_depth,
 			      sq_depth, &sq_head, &sq_tail,
@@ -258,12 +296,126 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 }
 
 /*
- * Host-side launcher functions called from
- * rocm_xio_memory.c.  These set up HIP events
- * for timing, launch the kernels, and collect
- * results.
+ * Host-side functions.  xio.h is only needed here
+ * for the setup API (not device code).
  */
+#include "xio.h"
+
 extern "C" {
+
+int rocm_xio_setup_mmio_bridge(
+	const char *rdma_dev_name,
+	uint64_t uar_mmap_offset,
+	uint32_t uar_qp_offset,
+	void **shadow_gpu_out,
+	uint16_t *ernic_bdf_out,
+	uint32_t *uar_bar_offset_out)
+{
+	*shadow_gpu_out = NULL;
+	*ernic_bdf_out = 0;
+	*uar_bar_offset_out = 0;
+
+	uint16_t bridge_bdf = 0;
+	int ret = xio::detectPciMmioBridgeBdf(&bridge_bdf);
+	if (ret != 0) {
+		fprintf(stderr,
+			"rocm-xio: detectPciMmioBridgeBdf "
+			"failed: %d\n", ret);
+		return -1;
+	}
+
+	void *shadow_cpu = NULL;
+	ret = xio::mapMmioBridgeShadowBuffer(bridge_bdf,
+					     &shadow_cpu);
+	if (ret != 0 || !shadow_cpu) {
+		fprintf(stderr,
+			"rocm-xio: mapMmioBridgeShadowBuffer "
+			"failed: %d\n", ret);
+		return -1;
+	}
+
+	const size_t shadow_size = 8192;
+	void *shadow_gpu = NULL;
+	ret = xio::registerMmioBridgeShadowBufferForGpu(
+		shadow_cpu, shadow_size, &shadow_gpu);
+	if (ret != 0 || !shadow_gpu) {
+		fprintf(stderr,
+			"rocm-xio: "
+			"registerMmioBridgeShadowBufferForGpu "
+			"failed: %d\n", ret);
+		return -1;
+	}
+
+	char res_path[256];
+	snprintf(res_path, sizeof(res_path),
+		 "/sys/class/infiniband/%s/device/resource",
+		 rdma_dev_name);
+	FILE *rf = fopen(res_path, "r");
+	unsigned long bar2_base = 0;
+	if (rf) {
+		unsigned long s, e, f;
+		if (fscanf(rf, "%lx %lx %lx", &s, &e, &f) == 3 &&
+		    fscanf(rf, "%lx %lx %lx", &s, &e, &f) == 3 &&
+		    fscanf(rf, "%lx %lx %lx", &bar2_base, &e, &f) == 3) {
+		}
+		fclose(rf);
+	}
+
+	uint32_t bar_offset = 0;
+	if (bar2_base && uar_mmap_offset >= bar2_base) {
+		uint64_t off64 = (uar_mmap_offset - bar2_base) +
+				 uar_qp_offset;
+		if (off64 <= UINT32_MAX)
+			bar_offset = (uint32_t)off64;
+		else
+			fprintf(stderr,
+				"rocm-xio: UAR BAR2 offset "
+				"0x%lx exceeds 32-bit\n",
+				(unsigned long)off64);
+	}
+
+	char sysfs_link[256];
+	snprintf(sysfs_link, sizeof(sysfs_link),
+		 "/sys/class/infiniband/%s/device",
+		 rdma_dev_name);
+	char link_buf[256];
+	ssize_t llen = readlink(sysfs_link, link_buf,
+				sizeof(link_buf) - 1);
+	uint16_t ernic_bdf = 0;
+	if (llen > 0) {
+		link_buf[llen] = '\0';
+		const char *p = strrchr(link_buf, '/');
+		if (p)
+			p++;
+		else
+			p = link_buf;
+		unsigned b = 0, d = 0, f = 0;
+		if (sscanf(p, "%*x:%x:%x.%x", &b, &d, &f) == 3)
+			ernic_bdf = (uint16_t)((b << 8) |
+					       (d << 3) | f);
+	}
+
+	if (ernic_bdf == 0 || bar_offset == 0) {
+		fprintf(stderr,
+			"rocm-xio: bridge cannot enable: "
+			"bdf=0x%04x, bar_offset=0x%x\n",
+			ernic_bdf, bar_offset);
+		return -1;
+	}
+
+	*shadow_gpu_out = shadow_gpu;
+	*ernic_bdf_out = ernic_bdf;
+	*uar_bar_offset_out = bar_offset;
+
+	fprintf(stderr,
+		"rocm-xio: pci-mmio-bridge enabled "
+		"(bridge=0x%04x, ernic=0x%04x, "
+		"bar_offset=0x%x, shadow=%p)\n",
+		bridge_bdf, ernic_bdf,
+		bar_offset, shadow_gpu);
+
+	return 0;
+}
 
 int rocm_xio_launch_write_bw_kernel(
 	void *sq_base, void *cq_base,
@@ -275,6 +427,9 @@ int rocm_xio_launch_write_bw_kernel(
 	uint32_t msg_size, uint64_t iterations,
 	uint32_t sq_depth, uint32_t sq_wqe_size,
 	uint32_t qp_handle, uint32_t cq_depth,
+	void *mmio_bridge_shadow,
+	uint16_t ernic_target_bdf,
+	uint32_t uar_bar_offset,
 	double *elapsed_usec)
 {
 	hipEvent_t start, stop;
@@ -291,7 +446,10 @@ int rocm_xio_launch_write_bw_kernel(
 		lkey, local_buf,
 		msg_size, iterations,
 		sq_depth, sq_wqe_size,
-		qp_handle, cq_depth);
+		qp_handle, cq_depth,
+		mmio_bridge_shadow,
+		ernic_target_bdf,
+		uar_bar_offset);
 
 	hipEventRecord(stop, 0);
 	hipEventSynchronize(stop);
@@ -324,6 +482,9 @@ int rocm_xio_launch_write_lat_kernel(
 	uint32_t msg_size, uint64_t iterations,
 	uint32_t sq_depth, uint32_t sq_wqe_size,
 	uint32_t qp_handle, uint32_t cq_depth,
+	void *mmio_bridge_shadow,
+	uint16_t ernic_target_bdf,
+	uint32_t uar_bar_offset,
 	double *iter_usec)
 {
 	uint64_t *gpu_ts = NULL;
@@ -339,6 +500,9 @@ int rocm_xio_launch_write_lat_kernel(
 		msg_size, iterations,
 		sq_depth, sq_wqe_size,
 		qp_handle, cq_depth,
+		mmio_bridge_shadow,
+		ernic_target_bdf,
+		uar_bar_offset,
 		gpu_ts);
 
 	hipDeviceSynchronize();
@@ -358,11 +522,6 @@ int rocm_xio_launch_write_lat_kernel(
 		  iterations * sizeof(uint64_t),
 		  hipMemcpyDeviceToHost);
 
-	/*
-	 * Convert GPU clock ticks to microseconds.
-	 * hipDeviceGetAttribute with
-	 * hipDeviceAttributeClockRate returns KHz.
-	 */
 	int clock_khz = 0;
 	hipDeviceGetAttribute(&clock_khz,
 			      hipDeviceAttributeClockRate, 0);

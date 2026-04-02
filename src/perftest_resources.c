@@ -2698,6 +2698,9 @@ int ctx_init(struct pingpong_context *ctx, struct perftest_parameters *user_para
 			fprintf(stderr, "Failed to create rocm-xio DV resources\n");
 			goto mr;
 		}
+		if (user_param->work_rdma_cm == OFF) {
+			modify_qp_to_init(ctx, user_param, 0);
+		}
 		return SUCCESS;
 	}
 

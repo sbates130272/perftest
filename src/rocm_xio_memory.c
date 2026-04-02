@@ -8,6 +8,10 @@
  * GPU-initiated WQE posting.
  */
 
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
 #ifdef HAVE_ROCM_XIO
 
 #include <stdio.h>
@@ -23,6 +27,7 @@
 #include "rocm_xio_memory.h"
 #include "perftest_parameters.h"
 #include "perftest_resources.h"
+#include "get_clock.h"
 
 #define ACCEL_PAGE_SIZE (64 * 1024)
 
@@ -41,8 +46,8 @@
 	} while (0)
 
 /*
- * DV function table: loaded from librocm_ernic.so
- * via dlopen/dlsym.
+ * DV struct definitions: must match the rocm_ernic
+ * provider header exactly.
  */
 struct rocm_ernic_dv_umem_attr {
 	void *addr;
@@ -125,10 +130,6 @@ struct dv_funcs {
 	fn_get_qp_attr get_qp_attr;
 };
 
-/*
- * Per-context DV resource state, attached to
- * pingpong_context->rocm_xio_dv.
- */
 struct rocm_xio_dv_state {
 	void *dl_handle;
 	struct dv_funcs dv;
@@ -161,6 +162,13 @@ struct rocm_xio_dv_state {
 	uint32_t uar_bar_offset;
 
 	int pci_mmio_bridge;
+
+	/* pci-mmio-bridge state */
+	void *mmio_bridge_shadow;
+	uint16_t ernic_target_bdf;
+
+	/* RDMA device name for sysfs lookups */
+	char rdma_dev_name[64];
 };
 
 struct rocm_xio_memory_ctx {
@@ -216,11 +224,6 @@ static int rocm_xio_allocate_buffer(struct memory_ctx *ctx, int alignment,
 	size_t buf_size = (size + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
 	hipError_t err;
 
-	/*
-	 * Allocate pinned host memory so the emulated
-	 * device can DMA-map it.  GPU VRAM buffers would
-	 * need vfio-user DMA proxy for GPU BARs.
-	 */
 	err = hipHostMalloc(&buf, buf_size, hipHostMallocDefault);
 	if (err != hipSuccess) {
 		fprintf(stderr, "rocm-xio: hipHostMalloc %lu failed: %d\n",
@@ -276,9 +279,7 @@ struct memory_ctx *rocm_xio_memory_create(struct perftest_parameters *params)
 }
 
 /*
- * DV resource management: create CQ/QP via the
- * rocm_ernic DV interface, set up UAR/doorbell
- * for GPU access.
+ * DV resource management.
  */
 
 static int dv_dlopen(struct rocm_xio_dv_state *st)
@@ -382,6 +383,18 @@ static int dv_create_cq(struct rocm_xio_dv_state *st,
 	return SUCCESS;
 }
 
+/*
+ * Extern: bridge setup in rocm_xio_kernels.hip
+ * (C++ / rocm-xio API calls).
+ */
+extern int rocm_xio_setup_mmio_bridge(
+	const char *rdma_dev_name,
+	uint64_t uar_mmap_offset,
+	uint32_t uar_qp_offset,
+	void **shadow_gpu_out,
+	uint16_t *ernic_bdf_out,
+	uint32_t *uar_bar_offset_out);
+
 int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 				 struct perftest_parameters *user_param)
 {
@@ -393,6 +406,11 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 		return FAILURE;
 
 	st->pci_mmio_bridge = user_param->rocm_xio_pci_mmio_bridge;
+
+	/* Save RDMA device name for sysfs lookups */
+	if (user_param->ib_devname)
+		snprintf(st->rdma_dev_name, sizeof(st->rdma_dev_name),
+			 "%s", user_param->ib_devname);
 
 	if (dv_dlopen(st) != SUCCESS) {
 		free(st);
@@ -458,7 +476,7 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	st->sq_ring_prod_tail = (volatile int32_t *)sq_ptr;
 	st->sq_wqe_base = (char *)sq_ptr + pgsz;
 
-	/* Allocate RQ buffer (minimal, not used for writes/reads) */
+	/* Allocate RQ buffer (minimal) */
 	uint32_t rq_wqe_sz = 64;
 	uint32_t rq_len = (uint32_t)pgsz;
 
@@ -523,7 +541,7 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	st->uar_mmap_offset = qa.uar_mmap_offset;
 	st->qp_handle = qa.qp_handle;
 
-	/* Map UAR for GPU access */
+	/* Map UAR for GPU access (fallback path) */
 	if (st->uar_ptr) {
 		herr = hipHostRegister(st->uar_ptr, (size_t)getpagesize(),
 				       hipHostRegisterDefault);
@@ -543,10 +561,32 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 		}
 	}
 
+	/* Set up pci-mmio-bridge for doorbell routing */
+	if (st->pci_mmio_bridge) {
+		void *shadow_gpu = NULL;
+		uint16_t ernic_bdf = 0;
+		uint32_t bar_offset = 0;
+		int bret = rocm_xio_setup_mmio_bridge(
+			st->rdma_dev_name,
+			st->uar_mmap_offset,
+			st->uar_qp_offset,
+			&shadow_gpu, &ernic_bdf, &bar_offset);
+		if (bret == 0) {
+			st->mmio_bridge_shadow = shadow_gpu;
+			st->ernic_target_bdf = ernic_bdf;
+			st->uar_bar_offset = bar_offset;
+		} else {
+			fprintf(stderr,
+				"rocm-xio: pci-mmio-bridge setup "
+				"failed, falling back to direct UAR\n");
+		}
+	}
+
 	printf("rocm-xio: DV QP created (QPN=%u, handle=%u, "
-	       "SQ depth=%u, UAR=%p)\n",
+	       "SQ depth=%u, UAR=%p, bridge=%s)\n",
 	       ctx->qp[0]->qp_num, st->qp_handle,
-	       st->sq_depth, st->uar_ptr);
+	       st->sq_depth, st->uar_ptr,
+	       st->mmio_bridge_shadow ? "enabled" : "disabled");
 
 	ctx->rocm_xio_dv = st;
 	return SUCCESS;
@@ -601,6 +641,9 @@ extern int rocm_xio_launch_write_bw_kernel(
 	uint32_t msg_size, uint64_t iterations,
 	uint32_t sq_depth, uint32_t sq_wqe_size,
 	uint32_t qp_handle, uint32_t cq_depth,
+	void *mmio_bridge_shadow,
+	uint16_t ernic_target_bdf,
+	uint32_t uar_bar_offset,
 	double *elapsed_usec);
 
 extern int rocm_xio_launch_write_lat_kernel(
@@ -613,6 +656,9 @@ extern int rocm_xio_launch_write_lat_kernel(
 	uint32_t msg_size, uint64_t iterations,
 	uint32_t sq_depth, uint32_t sq_wqe_size,
 	uint32_t qp_handle, uint32_t cq_depth,
+	void *mmio_bridge_shadow,
+	uint16_t ernic_target_bdf,
+	uint32_t uar_bar_offset,
 	double *iter_usec);
 
 int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
@@ -626,26 +672,30 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 	}
 
 	double elapsed_usec = 0.0;
+
+	user_param->tposted[0] = get_cycles();
+
 	int rc = rocm_xio_launch_write_bw_kernel(
 		st->sq_wqe_base, st->cq_buf,
 		st->sq_ring_prod_tail, st->gpu_uar_ptr,
 		st->uar_qp_offset,
-		ctx->rem_addr[0], ctx->mr[0]->rkey,
+		ctx->wr[0].wr.rdma.remote_addr,
+		ctx->wr[0].wr.rdma.rkey,
 		ctx->mr[0]->lkey, ctx->buf[0],
 		(uint32_t)user_param->size,
 		user_param->iters,
 		st->sq_depth, st->sq_wqe_size,
 		st->qp_handle, st->cq_depth,
+		st->mmio_bridge_shadow,
+		st->ernic_target_bdf,
+		st->uar_bar_offset,
 		&elapsed_usec);
+
+	user_param->tcompleted[0] = get_cycles();
 
 	if (rc != SUCCESS)
 		return FAILURE;
 
-	/*
-	 * Fill in perftest timing: tcompleted[0] stores
-	 * total elapsed time in cycles for BW calculation.
-	 */
-	user_param->tcompleted[0] = elapsed_usec;
 	return SUCCESS;
 }
 
@@ -667,12 +717,16 @@ int rocm_xio_run_iter_lat_write(struct pingpong_context *ctx,
 		st->sq_wqe_base, st->cq_buf,
 		st->sq_ring_prod_tail, st->gpu_uar_ptr,
 		st->uar_qp_offset,
-		ctx->rem_addr[0], ctx->mr[0]->rkey,
+		ctx->wr[0].wr.rdma.remote_addr,
+		ctx->wr[0].wr.rdma.rkey,
 		ctx->mr[0]->lkey, ctx->buf[0],
 		(uint32_t)user_param->size,
 		user_param->iters,
 		st->sq_depth, st->sq_wqe_size,
 		st->qp_handle, st->cq_depth,
+		st->mmio_bridge_shadow,
+		st->ernic_target_bdf,
+		st->uar_bar_offset,
 		iter_usec);
 
 	if (rc != SUCCESS) {
@@ -680,10 +734,6 @@ int rocm_xio_run_iter_lat_write(struct pingpong_context *ctx,
 		return FAILURE;
 	}
 
-	/*
-	 * Copy per-iteration latencies into the perftest
-	 * tposted/tcompleted arrays for reporting.
-	 */
 	for (uint64_t i = 0; i < user_param->iters; i++) {
 		user_param->tposted[i] = 0;
 		user_param->tcompleted[i] = iter_usec[i];
