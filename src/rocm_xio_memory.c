@@ -30,6 +30,11 @@
 #include "perftest_resources.h"
 #include "get_clock.h"
 
+extern int rocm_xio_alloc_host_pinned(size_t size, void **ptr);
+extern int rocm_xio_alloc_host_coherent(size_t size, void **ptr);
+extern void rocm_xio_free_host_pinned(void *ptr);
+extern void rocm_xio_free_host_coherent(void *ptr);
+
 #define ACCEL_PAGE_SIZE (64 * 1024)
 
 #define HIP_CHECK(call)                                         \
@@ -223,12 +228,10 @@ static int rocm_xio_allocate_buffer(struct memory_ctx *ctx, int alignment,
 	(void)alignment;
 	void *buf = NULL;
 	size_t buf_size = (size + ACCEL_PAGE_SIZE - 1) & ~(ACCEL_PAGE_SIZE - 1);
-	hipError_t err;
 
-	err = hipHostMalloc(&buf, buf_size, hipHostMallocDefault);
-	if (err != hipSuccess) {
-		fprintf(stderr, "rocm-xio: hipHostMalloc %lu failed: %d\n",
-			(unsigned long)buf_size, err);
+	if (rocm_xio_alloc_host_coherent(buf_size, &buf) != 0) {
+		fprintf(stderr, "rocm-xio: alloc data buffer %lu failed\n",
+			(unsigned long)buf_size);
 		return FAILURE;
 	}
 	memset(buf, 0, buf_size);
@@ -249,7 +252,7 @@ static int rocm_xio_free_buffer(struct memory_ctx *ctx, int dmabuf_fd,
 	(void)ctx;
 	(void)dmabuf_fd;
 	(void)size;
-	hipHostFree(addr);
+	rocm_xio_free_host_coherent(addr);
 	return SUCCESS;
 }
 
@@ -337,18 +340,10 @@ static int dv_create_cq(struct rocm_xio_dv_state *st,
 	alloc_len = (alloc_len + pgsz - 1) & ~(pgsz - 1);
 
 	void *buf = NULL;
-	if (posix_memalign(&buf, pgsz, alloc_len) != 0) {
-		fprintf(stderr, "rocm-xio: posix_memalign %s failed\n",
-			label);
+	if (rocm_xio_alloc_host_pinned(alloc_len, &buf) != 0) {
+		fprintf(stderr, "rocm-xio: alloc %s failed\n", label);
 		return FAILURE;
 	}
-	memset(buf, 0, alloc_len);
-	mlock(buf, alloc_len);
-	hipError_t herr = hipHostRegister(buf, alloc_len,
-					  hipHostRegisterDefault);
-	if (herr != hipSuccess)
-		fprintf(stderr, "rocm-xio: hipHostRegister %s: %s\n",
-			label, hipGetErrorString(herr));
 
 	struct rocm_ernic_dv_umem_attr ua;
 	memset(&ua, 0, sizeof(ua));
@@ -360,7 +355,7 @@ static int dv_create_cq(struct rocm_xio_dv_state *st,
 	struct rocm_ernic_dv_umem *umem = st->dv.umem_reg(ibctx, &ua);
 	if (!umem) {
 		fprintf(stderr, "rocm-xio: umem_reg %s failed\n", label);
-		hipHostFree(buf);
+		rocm_xio_free_host_pinned(buf);
 		return FAILURE;
 	}
 
@@ -373,7 +368,7 @@ static int dv_create_cq(struct rocm_xio_dv_state *st,
 	if (!*out_cq) {
 		fprintf(stderr, "rocm-xio: create_cq %s failed\n", label);
 		st->dv.umem_dereg(umem);
-		hipHostFree(buf);
+		rocm_xio_free_host_pinned(buf);
 		return FAILURE;
 	}
 
@@ -453,26 +448,11 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	sq_len += (uint32_t)pgsz;
 
 	void *sq_ptr = NULL;
-	if (posix_memalign(&sq_ptr, pgsz, sq_len) != 0) {
-		fprintf(stderr, "rocm-xio: posix_memalign SQ failed\n");
+	if (rocm_xio_alloc_host_pinned(sq_len, &sq_ptr) != 0) {
+		fprintf(stderr, "rocm-xio: alloc SQ failed\n");
 		free(st);
 		return FAILURE;
 	}
-	memset(sq_ptr, 0, sq_len);
-	mlock(sq_ptr, sq_len);
-	hipError_t herr = hipHostRegister(sq_ptr, sq_len,
-					  hipHostRegisterDefault);
-	if (herr != hipSuccess)
-		fprintf(stderr, "rocm-xio: hipHostRegister SQ: %s\n",
-			hipGetErrorString(herr));
-
-	/* Write marker to page 0 to verify UMEM mapping */
-	volatile int32_t *marker = (volatile int32_t *)sq_ptr;
-	marker[0] = 0xDEAD;
-	marker[1] = 0xBEEF;
-	printf("rocm-xio: SQ page0 marker written: "
-	       "[0]=0x%x [1]=0x%x at %p\n",
-	       marker[0], marker[1], sq_ptr);
 
 	struct rocm_ernic_dv_umem_attr sq_ua;
 	memset(&sq_ua, 0, sizeof(sq_ua));
@@ -484,7 +464,7 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	st->sq_umem = st->dv.umem_reg(ctx->context, &sq_ua);
 	if (!st->sq_umem) {
 		fprintf(stderr, "rocm-xio: umem_reg SQ failed\n");
-		hipHostFree(sq_ptr);
+		rocm_xio_free_host_pinned(sq_ptr);
 		free(st);
 		return FAILURE;
 	}
@@ -500,13 +480,11 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	uint32_t rq_len = (uint32_t)pgsz;
 
 	void *rq_ptr = NULL;
-	if (posix_memalign(&rq_ptr, pgsz, rq_len) != 0) {
-		fprintf(stderr, "rocm-xio: posix_memalign RQ failed\n");
+	if (rocm_xio_alloc_host_pinned(rq_len, &rq_ptr) != 0) {
+		fprintf(stderr, "rocm-xio: alloc RQ failed\n");
 		free(st);
 		return FAILURE;
 	}
-	memset(rq_ptr, 0, rq_len);
-	mlock(rq_ptr, rq_len);
 
 	struct rocm_ernic_dv_umem_attr rq_ua;
 	memset(&rq_ua, 0, sizeof(rq_ua));
@@ -518,7 +496,7 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	st->rq_umem = st->dv.umem_reg(ctx->context, &rq_ua);
 	if (!st->rq_umem) {
 		fprintf(stderr, "rocm-xio: umem_reg RQ failed\n");
-		hipHostFree(rq_ptr);
+		rocm_xio_free_host_pinned(rq_ptr);
 		free(st);
 		return FAILURE;
 	}
@@ -562,8 +540,9 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 
 	/* Map UAR for GPU access (fallback path) */
 	if (st->uar_ptr) {
-		herr = hipHostRegister(st->uar_ptr, (size_t)getpagesize(),
-				       hipHostRegisterDefault);
+		hipError_t herr = hipHostRegister(st->uar_ptr,
+				(size_t)getpagesize(),
+				hipHostRegisterDefault);
 		if (herr == hipSuccess) {
 			void *dev_uar = NULL;
 			herr = hipHostGetDevicePointer(&dev_uar, st->uar_ptr, 0);
@@ -641,11 +620,11 @@ void rocm_xio_destroy_dv_resources(struct pingpong_context *ctx)
 		st->dv.umem_dereg(st->cq_umem);
 
 	if (st->sq_buf)
-		hipHostFree(st->sq_buf);
+		rocm_xio_free_host_pinned(st->sq_buf);
 	if (st->rq_buf)
-		hipHostFree(st->rq_buf);
+		rocm_xio_free_host_pinned(st->rq_buf);
 	if (st->cq_buf)
-		hipHostFree(st->cq_buf);
+		rocm_xio_free_host_pinned(st->cq_buf);
 
 	if (st->dl_handle)
 		dlclose(st->dl_handle);

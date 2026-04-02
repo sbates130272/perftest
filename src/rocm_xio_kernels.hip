@@ -147,13 +147,15 @@ __device__ static void ring_doorbell(
 	uint32_t sq_depth,
 	void *mmio_bridge_shadow,
 	uint16_t ernic_target_bdf,
-	uint32_t uar_bar_offset)
+	uint32_t uar_bar_offset,
+	uint32_t count)
 {
 	if (sq_ring_prod_tail) {
 		int32_t cur = *sq_ring_prod_tail;
 		int32_t mask = (int32_t)((sq_depth << 1) - 1);
-		int32_t next = (cur + 1) & mask;
-		*sq_ring_prod_tail = next;
+		for (uint32_t i = 0; i < count; i++)
+			cur = (cur + 1) & mask;
+		*sq_ring_prod_tail = cur;
 	}
 
 	uint32_t val = (qp_handle & 0x00FFFFFF) | ERNIC_UAR_QP_SEND;
@@ -173,13 +175,14 @@ __device__ static void ring_doorbell(
 	}
 }
 
-__device__ static void poll_cq_until(
+__device__ static int poll_cq_until(
 	void *cq_base, uint32_t cq_depth,
 	uint32_t sq_depth,
 	uint32_t *sq_head, uint32_t *sq_tail,
 	uint32_t requested)
 {
 	volatile int32_t *cq_ring = (volatile int32_t *)cq_base;
+	uint64_t deadline = clock64() + (uint64_t)25000 * 1000000;
 
 	while (true) {
 		if (cq_ring) {
@@ -203,7 +206,10 @@ __device__ static void poll_cq_until(
 			sq_depth;
 		uint32_t available = sq_depth - consumed;
 		if (available >= requested)
-			return;
+			return 0;
+
+		if (clock64() > deadline)
+			return -1;
 	}
 }
 
@@ -221,12 +227,6 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 	uint16_t ernic_target_bdf,
 	uint32_t uar_bar_offset)
 {
-	/*
-	 * Read the current ring state prod_tail to find
-	 * the initial WQE slot.  The ring state may have
-	 * been advanced during QP state transitions
-	 * (INIT -> RTR -> RTS) by the provider.
-	 */
 	int32_t initial_prod = sq_ring_prod_tail ?
 		*sq_ring_prod_tail : 0;
 	uint32_t sq_tail = ((uint32_t)initial_prod) % sq_depth;
@@ -248,12 +248,13 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 			      qp_handle, sq_depth,
 			      mmio_bridge_shadow,
 			      ernic_target_bdf,
-			      uar_bar_offset);
-	}
+			      uar_bar_offset,
+			      1);
 
-	poll_cq_until(cq_base, cq_depth,
-		      sq_depth, &sq_head, &sq_tail,
-		      sq_depth);
+		poll_cq_until(cq_base, cq_depth,
+			      sq_depth, &sq_head, &sq_tail,
+			      sq_depth);
+	}
 }
 
 __global__ void rocm_xio_write_lat_gpu_kernel(
@@ -294,7 +295,8 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 			      qp_handle, sq_depth,
 			      mmio_bridge_shadow,
 			      ernic_target_bdf,
-			      uar_bar_offset);
+			      uar_bar_offset,
+			      1);
 
 		poll_cq_until(cq_base, cq_depth,
 			      sq_depth, &sq_head, &sq_tail,
@@ -312,6 +314,32 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 #include "xio.h"
 
 extern "C" {
+
+int rocm_xio_alloc_host_pinned(size_t size, void **ptr)
+{
+	hipError_t err = xio::allocHostMemory(size, ptr,
+		"perftest-xio", XIO_HOST_MEM_PINNED);
+	return (err == hipSuccess) ? 0 : -1;
+}
+
+int rocm_xio_alloc_host_coherent(size_t size, void **ptr)
+{
+	hipError_t err = xio::allocHostMemory(size, ptr,
+		"perftest-xio",
+		XIO_HOST_MEM_MAPPED | XIO_HOST_MEM_COHERENT);
+	return (err == hipSuccess) ? 0 : -1;
+}
+
+void rocm_xio_free_host_pinned(void *ptr)
+{
+	xio::freeHostMemory(ptr, XIO_HOST_MEM_PINNED);
+}
+
+void rocm_xio_free_host_coherent(void *ptr)
+{
+	xio::freeHostMemory(ptr,
+		XIO_HOST_MEM_MAPPED | XIO_HOST_MEM_COHERENT);
+}
 
 int rocm_xio_setup_mmio_bridge(
 	const char *rdma_dev_name,
