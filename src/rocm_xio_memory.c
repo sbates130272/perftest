@@ -744,6 +744,13 @@ int rocm_xio_run_iter_lat_write(struct pingpong_context *ctx,
 		return FAILURE;
 	}
 
+	if (!user_param->tcompleted) {
+		user_param->tcompleted =
+			calloc(user_param->iters, sizeof(cycles_t));
+		if (!user_param->tcompleted)
+			return FAILURE;
+	}
+
 	double *iter_usec = calloc(user_param->iters, sizeof(double));
 	if (!iter_usec)
 		return FAILURE;
