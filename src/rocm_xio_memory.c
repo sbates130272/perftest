@@ -667,7 +667,10 @@ extern int rocm_xio_launch_write_bw_kernel(
 	void *mmio_bridge_shadow,
 	uint16_t ernic_target_bdf,
 	uint32_t uar_bar_offset,
-	double *elapsed_usec);
+	double *elapsed_usec,
+	uint32_t dv_num_recv_slots,
+	uint64_t dv_tail_markers_addr,
+	uint32_t dv_chunk_size);
 
 extern int rocm_xio_launch_write_lat_kernel(
 	void *sq_base, void *cq_base,
@@ -708,6 +711,21 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 	       (uint32_t)user_param->size,
 	       (unsigned long)user_param->iters);
 
+	uint32_t dv_recv_slots = 0;
+	uint64_t dv_markers_addr = 0;
+	uint32_t dv_chunk = 0;
+	if (user_param->data_validation) {
+		dv_recv_slots = (uint32_t)(
+			user_param->validation_chunks_per_qp *
+			user_param->validation_chunk_size);
+		dv_markers_addr = ctx->rem_dest[0].tail_markers_vaddr;
+		dv_chunk = (uint32_t)user_param->validation_chunk_size;
+		printf("rocm-xio: DV enabled: recv_slots=%u "
+		       "markers_addr=%p chunk=%u\n",
+		       dv_recv_slots, (void *)(uintptr_t)dv_markers_addr,
+		       dv_chunk);
+	}
+
 	int rc = rocm_xio_launch_write_bw_kernel(
 		st->sq_wqe_base, st->cq_buf,
 		st->sq_ring_prod_tail, st->gpu_uar_ptr,
@@ -722,7 +740,10 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 		st->mmio_bridge_shadow,
 		st->ernic_target_bdf,
 		st->uar_bar_offset,
-		&elapsed_usec);
+		&elapsed_usec,
+		dv_recv_slots,
+		dv_markers_addr,
+		dv_chunk);
 
 	if (rc != SUCCESS)
 		return FAILURE;

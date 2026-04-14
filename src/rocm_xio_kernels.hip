@@ -227,13 +227,31 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 	void *mmio_bridge_shadow,
 	uint16_t ernic_target_bdf,
 	uint32_t uar_bar_offset,
-	uint64_t *gpu_elapsed)
+	uint64_t *gpu_elapsed,
+	uint32_t dv_num_recv_slots,
+	uint64_t dv_tail_markers_addr,
+	uint32_t dv_chunk_size)
 {
 	int32_t initial_prod = sq_ring_prod_tail ?
 		*sq_ring_prod_tail : 0;
 	uint32_t sq_tail = ((uint32_t)initial_prod) % sq_depth;
 	uint32_t sq_head = sq_tail;
-	uint64_t local_addr = (uint64_t)local_buf;
+	uint64_t base_local = (uint64_t)local_buf;
+	uint64_t base_remote = remote_addr;
+
+	int dv_enabled = (dv_num_recv_slots > 0 &&
+			  dv_tail_markers_addr != 0);
+	uint32_t recv_off = 0;
+	uint32_t send_off = 0;
+	uint64_t marker_epoch = 1;
+
+	/* Use a scratch area in the registered buffer for
+	 * staging marker values (after the 3 pattern regions,
+	 * 64-byte aligned). Must be covered by lkey. */
+	uint64_t marker_scratch = base_local +
+		(uint64_t)3 * msg_size;
+	/* Round up to 64-byte alignment */
+	marker_scratch = (marker_scratch + 63) & ~(uint64_t)63;
 
 	uint64_t t0 = __builtin_amdgcn_s_memrealtime();
 
@@ -241,9 +259,16 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 		poll_cq_until(cq_base, cq_depth,
 			      sq_depth, &sq_head, &sq_tail, 1);
 
+		uint64_t local_addr = base_local +
+			(dv_enabled ? (uint64_t)send_off * msg_size
+				    : 0);
+		uint64_t dest_addr = base_remote +
+			(dv_enabled ? (uint64_t)recv_off * msg_size
+				    : 0);
+
 		write_rdma_wqe(sq_base, sq_wqe_size,
 			       &sq_tail, sq_depth,
-			       remote_addr, rkey,
+			       dest_addr, rkey,
 			       lkey, local_addr,
 			       msg_size);
 
@@ -257,6 +282,50 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 
 		poll_cq_until(cq_base, cq_depth,
 			      sq_depth, &sq_head, &sq_tail, 1);
+
+		if (dv_enabled) {
+			recv_off++;
+			if (recv_off >= dv_num_recv_slots) {
+				recv_off = 0;
+				send_off++;
+				if (send_off >= 3)
+					send_off = 0;
+			}
+
+			if (dv_chunk_size > 0 &&
+			    (i + 1) % dv_chunk_size == 0) {
+				uint32_t chunk_id =
+					(uint32_t)(i / dv_chunk_size);
+				volatile uint64_t *ms =
+					(volatile uint64_t *)
+					marker_scratch;
+				*ms = marker_epoch;
+				__threadfence_system();
+
+				poll_cq_until(cq_base, cq_depth,
+					      sq_depth, &sq_head,
+					      &sq_tail, 1);
+				write_rdma_wqe(sq_base, sq_wqe_size,
+					       &sq_tail, sq_depth,
+					       dv_tail_markers_addr +
+					       chunk_id * 8,
+					       rkey, lkey,
+					       marker_scratch,
+					       8);
+				ring_doorbell(sq_ring_prod_tail,
+					      gpu_uar_ptr,
+					      uar_qp_offset,
+					      qp_handle, sq_depth,
+					      mmio_bridge_shadow,
+					      ernic_target_bdf,
+					      uar_bar_offset,
+					      1);
+				poll_cq_until(cq_base, cq_depth,
+					      sq_depth, &sq_head,
+					      &sq_tail, 1);
+				marker_epoch++;
+			}
+		}
 	}
 
 	uint64_t t1 = __builtin_amdgcn_s_memrealtime();
@@ -475,7 +544,10 @@ int rocm_xio_launch_write_bw_kernel(
 	void *mmio_bridge_shadow,
 	uint16_t ernic_target_bdf,
 	uint32_t uar_bar_offset,
-	double *elapsed_usec)
+	double *elapsed_usec,
+	uint32_t dv_num_recv_slots,
+	uint64_t dv_tail_markers_addr,
+	uint32_t dv_chunk_size)
 {
 	uint64_t *gpu_ts = NULL;
 	hipMalloc(&gpu_ts, sizeof(uint64_t));
@@ -496,7 +568,10 @@ int rocm_xio_launch_write_bw_kernel(
 		mmio_bridge_shadow,
 		ernic_target_bdf,
 		uar_bar_offset,
-		gpu_ts);
+		gpu_ts,
+		dv_num_recv_slots,
+		dv_tail_markers_addr,
+		dv_chunk_size);
 
 	hipDeviceSynchronize();
 
