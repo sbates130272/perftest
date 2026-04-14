@@ -389,6 +389,8 @@ int main(int argc, char *argv[])
 						fprintf(stderr," Failed to complete rocm_xio_run_iter_bw\n");
 						goto destroy_context;
 					}
+					if (user_param.data_validation)
+						usleep(500000);
 				} else if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
 					fprintf(stderr," Failed to complete run_iter_bw function successfully\n");
 					goto destroy_context;
@@ -466,6 +468,8 @@ int main(int argc, char *argv[])
 					fprintf(stderr," Failed to complete rocm_xio_run_iter_bw\n");
 					goto destroy_context;
 				}
+				if (user_param.data_validation)
+					usleep(500000);
 			} else if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
 				fprintf(stderr," Failed to complete run_iter_bw function successfully\n");
 				goto destroy_context;
@@ -602,8 +606,7 @@ int main(int argc, char *argv[])
 		return SUCCESS;
 	}
 
-	if (user_param.data_validation)
-		data_validation_destroy(&ctx);
+	data_validation_destroy(&ctx);
 	free(rem_dest);
 	free(my_dest);
 	free(user_param.ib_devname);
