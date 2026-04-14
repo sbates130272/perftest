@@ -730,9 +730,14 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 	double cpu_mhz = get_cpu_mhz(0);
 	if (cpu_mhz <= 0.0)
 		cpu_mhz = 1000.0;
-	user_param->tposted[0] = 0;
-	user_param->tcompleted[0] =
-		(cycles_t)(elapsed_usec * cpu_mhz);
+
+	double per_iter_usec = elapsed_usec / (double)user_param->iters;
+	for (uint64_t i = 0; i < user_param->iters; i++) {
+		user_param->tposted[i] =
+			(cycles_t)(per_iter_usec * i * cpu_mhz);
+		user_param->tcompleted[i] =
+			(cycles_t)(per_iter_usec * (i + 1) * cpu_mhz);
+	}
 
 	return SUCCESS;
 }

@@ -256,8 +256,7 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 			      1);
 
 		poll_cq_until(cq_base, cq_depth,
-			      sq_depth, &sq_head, &sq_tail,
-			      sq_depth);
+			      sq_depth, &sq_head, &sq_tail, 1);
 	}
 
 	uint64_t t1 = __builtin_amdgcn_s_memrealtime();
@@ -478,9 +477,12 @@ int rocm_xio_launch_write_bw_kernel(
 	uint32_t uar_bar_offset,
 	double *elapsed_usec)
 {
-	uint64_t *gpu_elapsed = NULL;
-	hipMalloc(&gpu_elapsed, sizeof(uint64_t));
-	hipMemset(gpu_elapsed, 0, sizeof(uint64_t));
+	uint64_t *gpu_ts = NULL;
+	hipMalloc(&gpu_ts, sizeof(uint64_t));
+	hipMemset(gpu_ts, 0, sizeof(uint64_t));
+
+	struct timespec ts_start, ts_end;
+	clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
 	rocm_xio_write_bw_gpu_kernel<<<1, 1>>>(
 		sq_base, cq_base,
@@ -494,22 +496,16 @@ int rocm_xio_launch_write_bw_kernel(
 		mmio_bridge_shadow,
 		ernic_target_bdf,
 		uar_bar_offset,
-		gpu_elapsed);
+		gpu_ts);
 
 	hipDeviceSynchronize();
 
-	uint64_t host_elapsed = 0;
-	hipMemcpy(&host_elapsed, gpu_elapsed,
-		  sizeof(uint64_t), hipMemcpyDeviceToHost);
-	hipFree(gpu_elapsed);
+	clock_gettime(CLOCK_MONOTONIC, &ts_end);
 
-	int wall_clock_khz = 0;
-	hipDeviceGetAttribute(&wall_clock_khz,
-			      hipDeviceAttributeWallClockRate, 0);
-	if (wall_clock_khz <= 0)
-		wall_clock_khz = 25000;
-	double ticks_per_us = (double)wall_clock_khz / 1000.0;
-	*elapsed_usec = (double)host_elapsed / ticks_per_us;
+	hipFree(gpu_ts);
+
+	*elapsed_usec = (double)(ts_end.tv_sec - ts_start.tv_sec) * 1e6 +
+			(double)(ts_end.tv_nsec - ts_start.tv_nsec) / 1e3;
 
 	hipError_t err = hipGetLastError();
 	if (err != hipSuccess) {
