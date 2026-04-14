@@ -1380,12 +1380,13 @@ static void force_dependecies(struct perftest_parameters *user_param)
 			exit(1);
 		}
 #endif
-		/* Require CUDA or HOST memory */
+		/* Require CUDA, HOST, or ROCM_XIO memory */
 		// cppcheck-suppress knownConditionTrueFalse
 		if (user_param->memory_type != MEMORY_CUDA &&
-		    user_param->memory_type != MEMORY_HOST) {
+		    user_param->memory_type != MEMORY_HOST &&
+		    user_param->memory_type != MEMORY_ROCM_XIO) {
 			printf(RESULT_LINE);
-			fprintf(stderr, " --data_validation requires --use_cuda or host memory\n");
+			fprintf(stderr, " --data_validation requires --use_cuda, --use_rocm_xio, or host memory\n");
 			exit(1);
 		}
 
