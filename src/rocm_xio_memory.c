@@ -714,16 +714,26 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 	uint32_t dv_recv_slots = 0;
 	uint64_t dv_markers_addr = 0;
 	uint32_t dv_chunk = 0;
-	if (user_param->data_validation) {
+	if (user_param->data_validation &&
+	    user_param->validation_chunks_per_qp > 0) {
 		dv_recv_slots = (uint32_t)(
 			user_param->validation_chunks_per_qp *
 			user_param->validation_chunk_size);
-		dv_markers_addr = ctx->rem_dest[0].tail_markers_vaddr;
 		dv_chunk = (uint32_t)user_param->validation_chunk_size;
+
+		uint64_t remote_base =
+			ctx->wr[0].wr.rdma.remote_addr -
+			ctx->recv_slots_offset;
+		dv_markers_addr = remote_base +
+			ctx->tail_markers_offset;
+
 		printf("rocm-xio: DV enabled: recv_slots=%u "
-		       "markers_addr=%p chunk=%u\n",
-		       dv_recv_slots, (void *)(uintptr_t)dv_markers_addr,
-		       dv_chunk);
+		       "markers_addr=0x%lx chunk=%u "
+		       "remote_base=0x%lx\n",
+		       dv_recv_slots,
+		       (unsigned long)dv_markers_addr,
+		       dv_chunk,
+		       (unsigned long)remote_base);
 	}
 
 	int rc = rocm_xio_launch_write_bw_kernel(
