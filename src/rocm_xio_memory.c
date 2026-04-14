@@ -708,8 +708,6 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 	       (uint32_t)user_param->size,
 	       (unsigned long)user_param->iters);
 
-	user_param->tposted[0] = get_cycles();
-
 	int rc = rocm_xio_launch_write_bw_kernel(
 		st->sq_wqe_base, st->cq_buf,
 		st->sq_ring_prod_tail, st->gpu_uar_ptr,
@@ -726,10 +724,15 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 		st->uar_bar_offset,
 		&elapsed_usec);
 
-	user_param->tcompleted[0] = get_cycles();
-
 	if (rc != SUCCESS)
 		return FAILURE;
+
+	double cpu_mhz = get_cpu_mhz(0);
+	if (cpu_mhz <= 0.0)
+		cpu_mhz = 1000.0;
+	user_param->tposted[0] = 0;
+	user_param->tcompleted[0] =
+		(cycles_t)(elapsed_usec * cpu_mhz);
 
 	return SUCCESS;
 }
@@ -776,9 +779,16 @@ int rocm_xio_run_iter_lat_write(struct pingpong_context *ctx,
 		return FAILURE;
 	}
 
+	double cpu_mhz = get_cpu_mhz(0);
+	if (cpu_mhz <= 0.0)
+		cpu_mhz = 1000.0;
+
+	uint64_t cumulative = 0;
 	for (uint64_t i = 0; i < user_param->iters; i++) {
-		user_param->tposted[i] = 0;
-		user_param->tcompleted[i] = iter_usec[i];
+		user_param->tposted[i] = (cycles_t)(cumulative * cpu_mhz);
+		cumulative += (uint64_t)(iter_usec[i] + 0.5);
+		user_param->tcompleted[i] =
+			(cycles_t)(cumulative * cpu_mhz);
 	}
 
 	free(iter_usec);

@@ -182,7 +182,8 @@ __device__ static int poll_cq_until(
 	uint32_t requested)
 {
 	volatile int32_t *cq_ring = (volatile int32_t *)cq_base;
-	uint64_t deadline = clock64() + (uint64_t)25000 * 1000000;
+	uint64_t deadline = __builtin_amdgcn_s_memrealtime() +
+		(uint64_t)25000 * 1000000;
 
 	while (true) {
 		if (cq_ring) {
@@ -208,7 +209,7 @@ __device__ static int poll_cq_until(
 		if (available >= requested)
 			return 0;
 
-		if (clock64() > deadline)
+		if (__builtin_amdgcn_s_memrealtime() > deadline)
 			return -1;
 	}
 }
@@ -225,13 +226,16 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 	uint32_t qp_handle, uint32_t cq_depth,
 	void *mmio_bridge_shadow,
 	uint16_t ernic_target_bdf,
-	uint32_t uar_bar_offset)
+	uint32_t uar_bar_offset,
+	uint64_t *gpu_elapsed)
 {
 	int32_t initial_prod = sq_ring_prod_tail ?
 		*sq_ring_prod_tail : 0;
 	uint32_t sq_tail = ((uint32_t)initial_prod) % sq_depth;
 	uint32_t sq_head = sq_tail;
 	uint64_t local_addr = (uint64_t)local_buf;
+
+	uint64_t t0 = __builtin_amdgcn_s_memrealtime();
 
 	for (uint64_t i = 0; i < iterations; i++) {
 		poll_cq_until(cq_base, cq_depth,
@@ -255,6 +259,10 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 			      sq_depth, &sq_head, &sq_tail,
 			      sq_depth);
 	}
+
+	uint64_t t1 = __builtin_amdgcn_s_memrealtime();
+	if (gpu_elapsed)
+		*gpu_elapsed = t1 - t0;
 }
 
 __global__ void rocm_xio_write_lat_gpu_kernel(
@@ -279,7 +287,7 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 	uint64_t local_addr = (uint64_t)local_buf;
 
 	for (uint64_t i = 0; i < iterations; i++) {
-		uint64_t t0 = clock64();
+		uint64_t t0 = __builtin_amdgcn_s_memrealtime();
 
 		poll_cq_until(cq_base, cq_depth,
 			      sq_depth, &sq_head, &sq_tail, 1);
@@ -302,7 +310,7 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 			      sq_depth, &sq_head, &sq_tail,
 			      sq_depth);
 
-		uint64_t t1 = clock64();
+		uint64_t t1 = __builtin_amdgcn_s_memrealtime();
 		gpu_timestamps[i] = t1 - t0;
 	}
 }
@@ -470,11 +478,9 @@ int rocm_xio_launch_write_bw_kernel(
 	uint32_t uar_bar_offset,
 	double *elapsed_usec)
 {
-	hipEvent_t start, stop;
-	hipEventCreate(&start);
-	hipEventCreate(&stop);
-
-	hipEventRecord(start, 0);
+	uint64_t *gpu_elapsed = NULL;
+	hipMalloc(&gpu_elapsed, sizeof(uint64_t));
+	hipMemset(gpu_elapsed, 0, sizeof(uint64_t));
 
 	rocm_xio_write_bw_gpu_kernel<<<1, 1>>>(
 		sq_base, cq_base,
@@ -487,17 +493,23 @@ int rocm_xio_launch_write_bw_kernel(
 		qp_handle, cq_depth,
 		mmio_bridge_shadow,
 		ernic_target_bdf,
-		uar_bar_offset);
+		uar_bar_offset,
+		gpu_elapsed);
 
-	hipEventRecord(stop, 0);
-	hipEventSynchronize(stop);
+	hipDeviceSynchronize();
 
-	float ms = 0.0f;
-	hipEventElapsedTime(&ms, start, stop);
-	*elapsed_usec = (double)ms * 1000.0;
+	uint64_t host_elapsed = 0;
+	hipMemcpy(&host_elapsed, gpu_elapsed,
+		  sizeof(uint64_t), hipMemcpyDeviceToHost);
+	hipFree(gpu_elapsed);
 
-	hipEventDestroy(start);
-	hipEventDestroy(stop);
+	int wall_clock_khz = 0;
+	hipDeviceGetAttribute(&wall_clock_khz,
+			      hipDeviceAttributeWallClockRate, 0);
+	if (wall_clock_khz <= 0)
+		wall_clock_khz = 25000;
+	double ticks_per_us = (double)wall_clock_khz / 1000.0;
+	*elapsed_usec = (double)host_elapsed / ticks_per_us;
 
 	hipError_t err = hipGetLastError();
 	if (err != hipSuccess) {
@@ -560,17 +572,15 @@ int rocm_xio_launch_write_lat_kernel(
 		  iterations * sizeof(uint64_t),
 		  hipMemcpyDeviceToHost);
 
-	int clock_khz = 0;
-	hipDeviceGetAttribute(&clock_khz,
-			      hipDeviceAttributeClockRate, 0);
-	double ticks_per_us = (double)clock_khz / 1000.0;
+	int wall_clock_khz = 0;
+	hipDeviceGetAttribute(&wall_clock_khz,
+			      hipDeviceAttributeWallClockRate, 0);
+	if (wall_clock_khz <= 0)
+		wall_clock_khz = 25000;
+	double ticks_per_us = (double)wall_clock_khz / 1000.0;
 
 	for (uint64_t i = 0; i < iterations; i++) {
-		if (ticks_per_us > 0.0)
-			iter_usec[i] = (double)host_ts[i] /
-				       ticks_per_us;
-		else
-			iter_usec[i] = 0.0;
+		iter_usec[i] = (double)host_ts[i] / ticks_per_us;
 	}
 
 	free(host_ts);
