@@ -264,8 +264,9 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 	     iterations > 0 ? i < iterations
 			    : __builtin_amdgcn_s_memrealtime() < deadline_tick;
 	     i++) {
-		poll_cq_until(cq_base, cq_depth,
-			      sq_depth, &sq_head, &sq_tail, 1);
+		if (poll_cq_until(cq_base, cq_depth,
+				  sq_depth, &sq_head, &sq_tail, 1) < 0)
+			break;
 
 		uint64_t local_addr = base_local +
 			(dv_enabled ? (uint64_t)send_off * msg_size
@@ -288,8 +289,9 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 			      uar_bar_offset,
 			      1);
 
-		poll_cq_until(cq_base, cq_depth,
-			      sq_depth, &sq_head, &sq_tail, 1);
+		if (poll_cq_until(cq_base, cq_depth,
+				  sq_depth, &sq_head, &sq_tail, 1) < 0)
+			break;
 
 		if (dv_enabled) {
 			recv_off++;
@@ -310,9 +312,10 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 				*ms = marker_epoch;
 				__threadfence_system();
 
-				poll_cq_until(cq_base, cq_depth,
-					      sq_depth, &sq_head,
-					      &sq_tail, 1);
+				if (poll_cq_until(cq_base, cq_depth,
+						  sq_depth, &sq_head,
+						  &sq_tail, 1) < 0)
+					break;
 				write_rdma_wqe(sq_base, sq_wqe_size,
 					       &sq_tail, sq_depth,
 					       dv_tail_markers_addr +
@@ -328,9 +331,10 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 					      ernic_target_bdf,
 					      uar_bar_offset,
 					      1);
-				poll_cq_until(cq_base, cq_depth,
-					      sq_depth, &sq_head,
-					      &sq_tail, 1);
+				if (poll_cq_until(cq_base, cq_depth,
+						  sq_depth, &sq_head,
+						  &sq_tail, 1) < 0)
+					break;
 				marker_epoch++;
 			}
 		}
@@ -371,8 +375,9 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 	for (uint64_t i = 0; i < iterations; i++) {
 		uint64_t t0 = __builtin_amdgcn_s_memrealtime();
 
-		poll_cq_until(cq_base, cq_depth,
-			      sq_depth, &sq_head, &sq_tail, 1);
+		if (poll_cq_until(cq_base, cq_depth,
+				  sq_depth, &sq_head, &sq_tail, 1) < 0)
+			break;
 
 		write_rdma_wqe(sq_base, sq_wqe_size,
 			       &sq_tail, sq_depth,
@@ -388,9 +393,10 @@ __global__ void rocm_xio_write_lat_gpu_kernel(
 			      uar_bar_offset,
 			      1);
 
-		poll_cq_until(cq_base, cq_depth,
-			      sq_depth, &sq_head, &sq_tail,
-			      sq_depth);
+		if (poll_cq_until(cq_base, cq_depth,
+				  sq_depth, &sq_head, &sq_tail,
+				  sq_depth) < 0)
+			break;
 
 		uint64_t t1 = __builtin_amdgcn_s_memrealtime();
 		gpu_timestamps[i] = t1 - t0;
