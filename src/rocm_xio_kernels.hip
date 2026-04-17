@@ -254,8 +254,16 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 	marker_scratch = (marker_scratch + 63) & ~(uint64_t)63;
 
 	uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+	uint64_t deadline_tick = 0;
+	uint64_t actual_iters = 0;
+	if (iterations == 0) {
+		deadline_tick = t0 + *gpu_elapsed;
+	}
 
-	for (uint64_t i = 0; i < iterations; i++) {
+	for (uint64_t i = 0;
+	     iterations > 0 ? i < iterations
+			    : __builtin_amdgcn_s_memrealtime() < deadline_tick;
+	     i++) {
 		poll_cq_until(cq_base, cq_depth,
 			      sq_depth, &sq_head, &sq_tail, 1);
 
@@ -326,11 +334,17 @@ __global__ void rocm_xio_write_bw_gpu_kernel(
 				marker_epoch++;
 			}
 		}
+		actual_iters++;
 	}
 
 	uint64_t t1 = __builtin_amdgcn_s_memrealtime();
-	if (gpu_elapsed)
-		*gpu_elapsed = t1 - t0;
+	if (gpu_elapsed) {
+		if (iterations == 0) {
+			*gpu_elapsed = actual_iters;
+		} else {
+			*gpu_elapsed = t1 - t0;
+		}
+	}
 }
 
 __global__ void rocm_xio_write_lat_gpu_kernel(
@@ -551,7 +565,28 @@ int rocm_xio_launch_write_bw_kernel(
 {
 	uint64_t *gpu_ts = NULL;
 	hipMalloc(&gpu_ts, sizeof(uint64_t));
-	hipMemset(gpu_ts, 0, sizeof(uint64_t));
+
+	if (iterations == 0) {
+		int wall_clock_khz = 0;
+		hipDeviceGetAttribute(&wall_clock_khz,
+				      hipDeviceAttributeWallClockRate, 0);
+		uint64_t freq = (uint64_t)wall_clock_khz * 1000;
+		if (freq == 0) {
+			int gpu_id = 0;
+			hipDeviceProp_t props;
+			hipGetDevice(&gpu_id);
+			hipGetDeviceProperties(&props, gpu_id);
+			freq = (uint64_t)props.clockRate * 1000;
+		}
+		uint64_t duration_ticks = freq * (uint64_t)(*elapsed_usec) / 1000000ULL;
+		hipMemcpy(gpu_ts, &duration_ticks, sizeof(uint64_t),
+			  hipMemcpyHostToDevice);
+		printf("rocm-xio: duration mode: %.0fs (%lu ticks, freq=%lu Hz)\n",
+		       *elapsed_usec / 1e6, (unsigned long)duration_ticks,
+		       (unsigned long)freq);
+	} else {
+		hipMemset(gpu_ts, 0, sizeof(uint64_t));
+	}
 
 	struct timespec ts_start, ts_end;
 	clock_gettime(CLOCK_MONOTONIC, &ts_start);
@@ -577,10 +612,20 @@ int rocm_xio_launch_write_bw_kernel(
 
 	clock_gettime(CLOCK_MONOTONIC, &ts_end);
 
-	hipFree(gpu_ts);
-
 	*elapsed_usec = (double)(ts_end.tv_sec - ts_start.tv_sec) * 1e6 +
 			(double)(ts_end.tv_nsec - ts_start.tv_nsec) / 1e3;
+
+	if (iterations == 0) {
+		uint64_t actual_iters = 0;
+		hipMemcpy(&actual_iters, gpu_ts, sizeof(uint64_t),
+			  hipMemcpyDeviceToHost);
+		double wall_usec = *elapsed_usec;
+		*elapsed_usec = -((double)actual_iters);
+		printf("rocm-xio: duration complete: %lu iterations in %.1fs\n",
+		       (unsigned long)actual_iters, wall_usec / 1e6);
+	}
+
+	hipFree(gpu_ts);
 
 	hipError_t err = hipGetLastError();
 	if (err != hipSuccess) {

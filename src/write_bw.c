@@ -389,8 +389,6 @@ int main(int argc, char *argv[])
 						fprintf(stderr," Failed to complete rocm_xio_run_iter_bw\n");
 						goto destroy_context;
 					}
-					if (user_param.data_validation)
-						usleep(500000);
 				} else if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
 					fprintf(stderr," Failed to complete run_iter_bw function successfully\n");
 					goto destroy_context;
@@ -468,8 +466,6 @@ int main(int argc, char *argv[])
 					fprintf(stderr," Failed to complete rocm_xio_run_iter_bw\n");
 					goto destroy_context;
 				}
-				if (user_param.data_validation)
-					usleep(500000);
 			} else if ((user_param.data_validation ? run_iter_bw_dv : run_iter_bw)(&ctx,&user_param)) {
 				fprintf(stderr," Failed to complete run_iter_bw function successfully\n");
 				goto destroy_context;
@@ -489,7 +485,6 @@ int main(int argc, char *argv[])
 				fprintf(stderr, "Failed to sync before stopping validation\n");
 				goto free_mem;
 			}
-			usleep(100000);  /* 100ms delay for validator to drain */
 		}
 
 		print_report_bw(&user_param,&my_bw_rep);

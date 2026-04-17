@@ -439,9 +439,17 @@ int rocm_xio_create_dv_resources(struct pingpong_context *ctx,
 	st->dv_recv_cq = recv_cq;
 	ctx->recv_cq = recv_cq;
 
-	/* Allocate SQ buffer: page 0 = ring state, rest = WQEs */
+	/* Allocate SQ buffer: page 0 = ring state, rest = WQEs.
+	 * PVRDMA ring uses bitmask indexing (head & (depth-1))
+	 * so depth must be a power of 2. */
 	uint32_t sq_wqe_sz = 128;
 	uint32_t sq_depth = (uint32_t)user_param->tx_depth;
+	{
+		uint32_t p = 1;
+		while (p < sq_depth)
+			p <<= 1;
+		sq_depth = p;
+	}
 	uint32_t sq_len = sq_depth * sq_wqe_sz;
 
 	if (sq_len < pgsz)
@@ -697,19 +705,25 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 		return FAILURE;
 	}
 
+	int duration_mode = (user_param->test_type == DURATION);
 	double elapsed_usec = 0.0;
+
+	if (duration_mode) {
+		elapsed_usec = (double)user_param->duration * 1e6;
+	}
 
 	volatile int32_t *rs = (volatile int32_t *)st->sq_buf;
 	printf("rocm-xio: pre-launch ring state: "
 	       "[0]=%d [1]=%d [2]=%d [3]=%d\n",
 	       rs[0], rs[1], rs[2], rs[3]);
 	printf("rocm-xio: remote_addr=0x%llx rkey=0x%x "
-	       "lkey=0x%x local_buf=%p size=%u iters=%lu\n",
+	       "lkey=0x%x local_buf=%p size=%u iters=%lu%s\n",
 	       (unsigned long long)ctx->wr[0].wr.rdma.remote_addr,
 	       ctx->wr[0].wr.rdma.rkey,
 	       ctx->mr[0]->lkey, ctx->buf[0],
 	       (uint32_t)user_param->size,
-	       (unsigned long)user_param->iters);
+	       (unsigned long)user_param->iters,
+	       duration_mode ? " (duration mode)" : "");
 
 	uint32_t dv_recv_slots = 0;
 	uint64_t dv_markers_addr = 0;
@@ -762,12 +776,19 @@ int rocm_xio_run_iter_bw(struct pingpong_context *ctx,
 	if (cpu_mhz <= 0.0)
 		cpu_mhz = 1000.0;
 
-	double per_iter_usec = elapsed_usec / (double)user_param->iters;
-	for (uint64_t i = 0; i < user_param->iters; i++) {
-		user_param->tposted[i] =
-			(cycles_t)(per_iter_usec * i * cpu_mhz);
-		user_param->tcompleted[i] =
-			(cycles_t)(per_iter_usec * (i + 1) * cpu_mhz);
+	if (duration_mode) {
+		user_param->iters = (uint64_t)(-elapsed_usec);
+		elapsed_usec = (double)user_param->duration * 1e6;
+		printf("rocm-xio: duration result: %lu iters in %.1fs\n",
+		       (unsigned long)user_param->iters,
+		       elapsed_usec / 1e6);
+	}
+
+	if (user_param->iters > 0) {
+		double per_iter_usec = elapsed_usec / (double)user_param->iters;
+		user_param->tposted[0] = 0;
+		user_param->tcompleted[0] =
+			(cycles_t)(elapsed_usec * cpu_mhz);
 	}
 
 	return SUCCESS;
