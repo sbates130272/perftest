@@ -2332,7 +2332,13 @@ static int register_memory_region(struct pingpong_context *ctx,
 		fprintf(stderr, "Couldn't allocate MR with error=%d\n", errno);
 
 		if (dmabuf_fd && errno == EOPNOTSUPP) {
-			fprintf(stderr, "OFED stack does not support DMA-BUF\n");
+			/* EOPNOTSUPP here is the kernel RDMA driver declining the
+			 * dma_buf, not a userspace limitation: the device has no
+			 * .reg_user_mr_dmabuf, or it has one that rejected this
+			 * importer/exporter pair. */
+			fprintf(stderr,
+				"This RDMA device's kernel driver does not support "
+				"dma_buf memory regions\n");
 			close(dmabuf_fd);
 		}
 

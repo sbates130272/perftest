@@ -67,7 +67,9 @@ enum validation_mismatch_type {
  * Portable inline qualifier: works in both C (.c) and CUDA (.cu) files.
  */
 #ifndef VALIDATION_INLINE
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
+/* hipcc compiles .hip like nvcc compiles .cu: the shared helpers below are
+ * called from device code on both, so both need the device annotation. */
 #define VALIDATION_INLINE __host__ __device__ static inline
 #else
 #define VALIDATION_INLINE static inline
