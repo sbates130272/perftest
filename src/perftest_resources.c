@@ -2143,9 +2143,55 @@ static int initialize_buffer_content(struct pingpong_context *ctx,
 
 		memset(host_buf, 0, ctx->buff_size);
 
-		for (i = 0; i < VALIDATION_PATTERNS_COUNT; i++) {
-			uint8_t value = validation_cycle_to_pattern(i);
-			memset(host_buf + i * payload_size, value, payload_size);
+		/*
+		 * EXPERIMENT (not for merge): PERFTEST_VALIDATION_LFSR=1 fills
+		 * the send region with one continuous run of the maximal LFSR
+		 * instead of three constant-byte buffers. Same cost -- one pass
+		 * at init, no per-send regeneration -- but every 64-bit word is
+		 * distinct, so position becomes part of the content.
+		 *
+		 * The seed would normally arrive from the peer in
+		 * struct pingpong_dest; PERFTEST_VALIDATION_SEED stands in for
+		 * that here so both sides can be pinned from the environment.
+		 */
+		if (getenv("PERFTEST_VALIDATION_LFSR")) {
+			const char *sd = getenv("PERFTEST_VALIDATION_SEED");
+			uint64_t seed = sd ? strtoull(sd, NULL, 0)
+					   : 0x0123456789ABCDEFULL;
+			uint64_t st = validation_lfsr_start(seed, 0, 0, 0);
+			uint64_t fill_bytes = (uint64_t)VALIDATION_PATTERNS_COUNT *
+					      payload_size;
+			uint8_t *p = (uint8_t *)host_buf;
+			uint64_t off;
+
+			/*
+			 * Copy byte-wise at the tail rather than striding whole
+			 * words: payload_size need not be a multiple of 8, and
+			 * a word-count fill silently leaves the remainder zero.
+			 * At -s 4 that rounds the whole region down to nothing,
+			 * and a zero-filled send buffer reads on the far side
+			 * as "never written" rather than as a short payload.
+			 */
+			for (off = 0; off < fill_bytes; off += sizeof(st)) {
+				uint64_t n = fill_bytes - off;
+
+				if (n > sizeof(st))
+					n = sizeof(st);
+				memcpy(p + off, &st, n);
+				st = validation_lfsr_next(st);
+			}
+			if (user_param->data_validation_debug)
+				printf("Data validation: LFSR fill, seed=0x%016llx, "
+				       "%llu bytes, poly=0x%016llx\n",
+				       (unsigned long long)seed,
+				       (unsigned long long)fill_bytes,
+				       (unsigned long long)VALIDATION_LFSR_POLY);
+		} else {
+			for (i = 0; i < VALIDATION_PATTERNS_COUNT; i++) {
+				uint8_t value = validation_cycle_to_pattern(i);
+				memset(host_buf + i * payload_size, value,
+				       payload_size);
+			}
 		}
 
 		/* READ: seed tail_markers to 1 so first FETCH_AND_ADD returns non-zero */

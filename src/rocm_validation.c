@@ -212,6 +212,96 @@ int rocm_validation_start(struct memory_ctx *ctx)
 	return 0;
 }
 
+#ifdef HAVE_ROCM_KERNELS
+/*
+ * EXPERIMENT (not for merge): compare in VRAM with a one-shot kernel launched
+ * after the traffic, instead of copying to the host. Selected with
+ * PERFTEST_ROCM_VALIDATION=oneshot. The prototype lives in rocm_kernels.h,
+ * and this whole path is compiled out without hipcc -- the kernel it calls is
+ * only built when HAVE_ROCM_KERNELS is set.
+ */
+static int rocm_validation_stop_oneshot(struct data_validation_result *result)
+{
+	uint64_t chunks = 0, bytes = 0, errors = 0, err_off = 0, no_lock = 0;
+	int lfsr = getenv("PERFTEST_VALIDATION_LFSR") ? 1 : 0;
+	uint32_t err_chunk = 0;
+	uint8_t exp = 0, act = 0;
+
+	if (!g_rv.initialized || !result)
+		return -1;
+	memset(result, 0, sizeof(*result));
+
+	/*
+	 * Negative control for the in-VRAM path. The staged fault hook flips
+	 * bytes in the HOST copy, which cannot corrupt what this kernel reads
+	 * -- so a pass from oneshot would be unfalsifiable without this.
+	 * Corrupt the DEVICE buffer instead, then let the GPU find it.
+	 */
+	{
+		const char *f = getenv("PERFTEST_ROCM_ONESHOT_FAULT");
+
+		if (f) {
+			unsigned char bad = 0xFF;
+			uint64_t n = strtoull(f, NULL, 0);
+			uint64_t i;
+
+			if (n == 0)
+				n = 1;
+			/*
+			 * Spread the flips a page apart, as the staged hook
+			 * does, so they land in distinct chunks rather than
+			 * all inside the first one.
+			 */
+			for (i = 0; i < n; i++) {
+				uint64_t off = g_rv.recv_slots_offset + i * 4096;
+
+				if (off >= g_rv.device_span)
+					break;
+				if (hipMemcpy((uint8_t *)g_rv.device_base + off,
+					      &bad, 1, hipMemcpyHostToDevice)
+				    != hipSuccess)
+					return -1;
+			}
+			RVLOG("oneshot fault injection: corrupted %llu byte(s) in VRAM",
+			      (unsigned long long)i);
+		}
+	}
+
+	if (rocm_kernel_oneshot_validate(
+		    (uint8_t *)g_rv.device_base + g_rv.markers_offset,
+		    (uint8_t *)g_rv.device_base + g_rv.recv_slots_offset,
+		    g_rv.num_qps, g_rv.chunks_per_qp,
+		    g_rv.ops_per_chunk, g_rv.payload_size, lfsr,
+		    &chunks, &bytes, &errors, &no_lock, &err_chunk, &err_off,
+		    &exp, &act) != 0)
+		return -1;
+
+	result->chunks_validated = chunks;
+	result->bytes_validated = bytes;
+	result->errors_found = errors;
+	result->error_chunk_id = err_chunk;
+	result->error_byte_offset = err_off;
+	result->error_expected = exp;
+	result->error_actual = act;
+	/*
+	 * A chunk that could not be locked is not a pass: the ring covers
+	 * every non-zero value, so failing to lock means the slot was never
+	 * written. Report it separately from a mismatch -- they have
+	 * different causes and different fixes.
+	 */
+	result->passed = (errors == 0 && no_lock == 0 && chunks > 0) ? 1 : 0;
+	printf(VALIDATION_LOG_PREFIX
+	       " rocm: one-shot in-VRAM GPU compare%s\n",
+	       lfsr ? " (LFSR lock-and-predict)" : "");
+	if (no_lock)
+		fprintf(stderr, VALIDATION_LOG_PREFIX
+			" rocm: %llu chunk(s) COULD NOT LOCK onto the LFSR "
+			"stream (slot never written)\n",
+			(unsigned long long)no_lock);
+	return 0;
+}
+#endif /* HAVE_ROCM_KERNELS */
+
 static int rocm_validation_stop_staged(struct data_validation_result *result)
 {
 
@@ -462,6 +552,14 @@ int rocm_validation_stop(struct memory_ctx *ctx,
 	 * host: the reference implementation, and the fallback for a device
 	 * that cannot run the kernel at all.
 	 */
+#ifdef HAVE_ROCM_KERNELS
+	{
+		const char *m = getenv("PERFTEST_ROCM_VALIDATION");
+
+		if (m && !strcmp(m, "oneshot"))
+			return rocm_validation_stop_oneshot(result);
+	}
+#endif
 	printf(VALIDATION_LOG_PREFIX " rocm: host-staged validation\n");
 	return rocm_validation_stop_staged(result);
 }

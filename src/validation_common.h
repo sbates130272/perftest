@@ -88,6 +88,89 @@ VALIDATION_INLINE uint8_t validation_cycle_to_pattern(uint64_t cycle)
 			 (cycle % VALIDATION_PATTERNS_COUNT));
 }
 
+/*
+ * Excluded from the CUDA translation units entirely, not merely unused there.
+ * VALIDATION_INLINE expands to __host__ __device__ under __CUDACC__, so
+ * leaving these visible would have nvcc emit device code for helpers no CUDA
+ * path calls. The CUDA backend still expects the constant-byte patterns; when
+ * it learns this stream, drop the guard rather than working around it.
+ */
+#ifndef __CUDACC__
+
+/*
+ * ---------------------------------------------------------------------------
+ * EXPERIMENT (not for merge): seed-based 64-bit LFSR payload.
+ *
+ * The constant-byte pattern above carries ~1.58 bits: three values, chosen by
+ * cycle % 3. It cannot see a reordering inside a chunk (permuting identical
+ * bytes is a no-op), a write landing at the wrong offset within the same
+ * pattern, or data that is exactly three cycles stale.
+ *
+ * This fills the payload with the output of a maximal-length Galois LFSR
+ * instead, so every 64-bit word in the stream is distinct and position is
+ * part of the content.
+ *
+ * The polynomial is x^64 + x^63 + x^61 + x^60 + 1, which for the right-shift
+ * Galois step below has period 2^64 - 1 = 18446744073709551615. Verified, not
+ * assumed: the 64x64 GF(2) transition matrix T of the exact step() below
+ * satisfies T^(2^64-1) == I, and T^((2^64-1)/p) != I for every prime factor p
+ * of 2^64-1 (3, 5, 17, 257, 641, 65537, 6700417). A degree-64 polynomial is
+ * primitive exactly when that holds.
+ *
+ * ONE RING. Because the polynomial is maximal, the state space is a single
+ * cycle through every non-zero 64-bit value. Two consequences that decide how
+ * the receiver works:
+ *
+ *   - Any non-zero word is a valid state, so "locking" onto the stream from
+ *     received data always succeeds unless the data is zero. Lock failure
+ *     therefore means "nothing was written here", which is worth reporting on
+ *     its own.
+ *   - A different seed does not give a different sequence, it gives a
+ *     different PHASE of the same sequence. So ring membership cannot tell
+ *     correctly-placed data from stale or misdirected data; only the expected
+ *     phase can, and that is what knowing the remote's seed buys.
+ * ---------------------------------------------------------------------------
+ */
+#define VALIDATION_LFSR_POLY  0xD800000000000000ULL
+
+VALIDATION_INLINE uint64_t validation_lfsr_next(uint64_t s)
+{
+	uint64_t lsb = s & 1ULL;
+
+	s >>= 1;
+	if (lsb)
+		s ^= VALIDATION_LFSR_POLY;
+	return s;
+}
+
+/*
+ * Starting state for a given (seed, qp, chunk, cycle). Mixed with a
+ * splitmix64 finalizer so adjacent chunks and cycles land far apart on the
+ * ring rather than a few steps apart, which would make a stale chunk look
+ * almost right. Never returns 0: 0 is the LFSR's absorbing state.
+ */
+VALIDATION_INLINE uint64_t validation_lfsr_start(uint64_t seed, uint32_t qp,
+						 uint32_t chunk, uint64_t cycle)
+{
+	uint64_t s = seed;
+
+	s ^= 0x9E3779B97F4A7C15ULL * (uint64_t)(qp + 1u);
+	s ^= 0xBF58476D1CE4E5B9ULL * (uint64_t)(chunk + 1u);
+	s ^= 0x94D049BB133111EBULL * (cycle + 1ULL);
+	s ^= s >> 30; s *= 0xBF58476D1CE4E5B9ULL;
+	s ^= s >> 27; s *= 0x94D049BB133111EBULL;
+	s ^= s >> 31;
+	return s ? s : 1ULL;
+}
+
+/* Outcome of a receiver-side lock-and-predict pass over one chunk. */
+#define VALIDATION_LFSR_OK         0
+#define VALIDATION_LFSR_NO_LOCK    1   /* first word zero: nothing written */
+#define VALIDATION_LFSR_MISMATCH   2   /* ring broke: corruption or reorder */
+#define VALIDATION_LFSR_PHASE      3   /* valid ring, wrong place: stale data */
+
+#endif /* !__CUDACC__ */
+
 VALIDATION_INLINE int validation_is_pattern(uint8_t value)
 {
 	return value >= VALIDATION_PATTERN_0 &&

@@ -57,6 +57,24 @@ int rocm_kernel_validation_check_status(void);
 /* 1 if a HIP device is usable, 0 otherwise. */
 int rocm_kernels_available(void);
 
+/*
+ * EXPERIMENT (not for merge): one-shot post-DMA compare, run in VRAM after
+ * the traffic rather than staging the buffer through host memory. Selected
+ * with PERFTEST_ROCM_VALIDATION=oneshot. lfsr_mode selects lock-and-predict
+ * over the LFSR stream instead of the constant-byte patterns.
+ *
+ * Declared here rather than at the call site so the prototype is checked
+ * against the definition in rocm_kernels.hip.
+ */
+int rocm_kernel_oneshot_validate(void *markers, void *slots,
+				 uint32_t num_qps, uint32_t chunks_per_qp,
+				 uint64_t ops_per_chunk, uint64_t payload_size,
+				 int lfsr_mode,
+				 uint64_t *chunks, uint64_t *bytes,
+				 uint64_t *errors, uint64_t *no_lock,
+				 uint32_t *err_chunk, uint64_t *err_off,
+				 uint8_t *err_expected, uint8_t *err_actual);
+
 #ifdef __cplusplus
 }
 #endif

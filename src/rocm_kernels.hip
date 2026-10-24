@@ -1021,6 +1021,221 @@ extern "C" int rocm_init_gpu_stop_flag(volatile int **stop_flag)
  * libperftest_kernels.so dlopen'd at all. These kernels are linked in
  * unconditionally, so rocm_validation.c needs a runtime probe instead.
  */
+
+/* ------------------------------------------------------------------------
+ * EXPERIMENT (not for merge): one-shot post-DMA validation.
+ *
+ * Launched AFTER the traffic has completed, so every marker is already final
+ * and there is nothing to watch for: one pass over the marker array finds
+ * every chunk that completed a cycle and compares its slot bytes IN VRAM.
+ * No polling, no should_stop, no monitor/validator split -- none of which a
+ * device that will not start a 33x1024 launch until hipDeviceSynchronize()
+ * can support anyway.
+ *
+ * Mirrors rocm_validation_stop_staged()'s comparison exactly (first mismatch
+ * per chunk, marker==0 skipped), but reads device memory directly instead of
+ * a host copy, so a pass here is evidence the GPU can read what the RNIC
+ * DMA'd into VRAM.
+ * --------------------------------------------------------------------- */
+
+struct OneShotResult {
+	unsigned long long chunks;
+	unsigned long long bytes;
+	unsigned long long errors;
+	unsigned long long no_lock;
+	unsigned long long first_chunk;
+	unsigned long long first_off;
+	unsigned int       first_expected;
+	unsigned int       first_actual;
+	unsigned int       claimed;   /* CAS gate: one writer for the record */
+};
+
+__global__ void oneshot_validate_kernel(const uint64_t *markers,
+					const uint8_t *slots,
+					uint32_t num_qps,
+					uint32_t chunks_per_qp,
+					uint64_t ops_per_chunk,
+					uint64_t payload_size,
+					int lfsr_mode,
+					struct OneShotResult *out)
+{
+	uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+	uint32_t total = num_qps * chunks_per_qp;
+	if (idx >= total)
+		return;
+
+	const uint64_t chunk_bytes = ops_per_chunk * payload_size;
+	const uint64_t slots_per_qp = ops_per_chunk * chunks_per_qp;
+	uint32_t q = idx / chunks_per_qp;
+	uint32_t c = idx % chunks_per_qp;
+
+	/* system scope: these were written by the NIC, not by this kernel */
+	uint64_t marker = __hip_atomic_load(&markers[idx], __ATOMIC_ACQUIRE,
+					    __HIP_MEMORY_SCOPE_SYSTEM);
+	if (marker == 0)
+		return;
+
+	const uint8_t *base = slots +
+		(q * slots_per_qp + (uint64_t)c * ops_per_chunk) * payload_size;
+
+	uint64_t off = 0;
+	int mismatch = 0;
+	uint8_t want = 0;
+	uint8_t lfsr_got = 0;
+	int have_lfsr_got = 0;
+
+	if (lfsr_mode) {
+		/*
+		 * Lock onto the stream from the data itself, then predict
+		 * forward. The first word IS the state -- a maximal LFSR's
+		 * ring covers every non-zero value, so any non-zero word is a
+		 * legal lock, and a zero word means nothing was written.
+		 *
+		 * PER SEND WINDOW, not per chunk. The sender pre-fills only
+		 * VALIDATION_PATTERNS_COUNT * payload_size and cycles those
+		 * windows, so one chunk of ops_per_chunk sends is NOT one
+		 * continuous run of the ring -- it is the same few windows
+		 * repeated, and the ring breaks at every payload_size
+		 * boundary. Validating per window matches what the sender
+		 * actually produces and still catches reordering, truncation
+		 * and corruption inside a window.
+		 *
+		 * Making a whole chunk continuous would need the send region
+		 * grown to ops_per_chunk * chunks_per_qp * payload_size, i.e.
+		 * as large as the receive ring.
+		 */
+		uint64_t wwords = payload_size / sizeof(uint64_t);
+		uint64_t nwin = chunk_bytes / payload_size;
+
+		/*
+		 * Below two words per send there is nothing to predict: the
+		 * first word is consumed locking onto the ring, so a payload
+		 * under 16 bytes would fall straight through the loop and be
+		 * counted as a clean chunk. Report it as a failure to lock
+		 * rather than as a pass nothing was checked for.
+		 */
+		if (wwords < 2) {
+			atomicAdd(&out->no_lock, 1ULL);
+			atomicAdd(&out->chunks, 1ULL);
+			return;
+		}
+
+		for (uint64_t win = 0; win < nwin && !mismatch; win++) {
+			const uint64_t *w =
+				(const uint64_t *)(base + win * payload_size);
+			uint64_t st = w[0];
+
+			if (st == 0ULL) {
+				atomicAdd(&out->no_lock, 1ULL);
+				atomicAdd(&out->chunks, 1ULL);
+				return;
+			}
+			for (uint64_t k = 1; k < wwords; k++) {
+				st = validation_lfsr_next(st);
+				if (w[k] != st) {
+					mismatch = 1;
+					off = win * payload_size +
+					      k * sizeof(uint64_t);
+					/*
+					 * Report the low byte of the predicted
+					 * and observed WORD. Leaving these
+					 * unset printed "expected 0x00", which
+					 * is not what was expected of anything.
+					 */
+					want = (uint8_t)(st & 0xffULL);
+					lfsr_got = (uint8_t)(w[k] & 0xffULL);
+					have_lfsr_got = 1;
+					break;
+				}
+			}
+		}
+	} else {
+		want = validation_cycle_to_pattern(marker - 1);
+		for (; off < chunk_bytes; off++) {
+			if (base[off] != want) { mismatch = 1; break; }
+		}
+	}
+
+	atomicAdd(&out->chunks, 1ULL);
+	if (mismatch) {
+		atomicAdd(&out->errors, 1ULL);
+		/*
+		 * Claim the error record exactly once, rather than letting
+		 * every thread whose chunk id wins an atomicMin write into it.
+		 * With a min and four separate stores two threads can both
+		 * pass the test -- ties compare equal, and a lower chunk can
+		 * arrive after a higher one has started writing -- and the
+		 * fields then come from different chunks. A report naming one
+		 * chunk's id beside another's offset and a third's bytes costs
+		 * more debugging time than it saves.
+		 *
+		 * The cost is that this is "an" failing chunk rather than the
+		 * lowest-numbered one. The host path reports first in
+		 * iteration order; here the chunks are examined in parallel,
+		 * so there is no first to report.
+		 */
+		if (atomicCAS(&out->claimed, 0u, 1u) == 0u) {
+			out->first_chunk = c;
+			out->first_off = off;
+			out->first_expected = want;
+			out->first_actual = have_lfsr_got ? lfsr_got
+							  : base[off];
+		}
+	} else {
+		atomicAdd(&out->bytes, (unsigned long long)chunk_bytes);
+	}
+}
+
+extern "C" int rocm_kernel_oneshot_validate(void *markers, void *slots,
+					    uint32_t num_qps,
+					    uint32_t chunks_per_qp,
+					    uint64_t ops_per_chunk,
+					    uint64_t payload_size,
+					    int lfsr_mode,
+					    uint64_t *chunks, uint64_t *bytes,
+					    uint64_t *errors, uint64_t *no_lock,
+					    uint32_t *err_chunk,
+					    uint64_t *err_off,
+					    uint8_t *err_expected,
+					    uint8_t *err_actual)
+{
+	struct OneShotResult *res = NULL;
+	hipError_t err = hipMallocManaged((void **)&res, sizeof(*res));
+	if (err != hipSuccess)
+		return -1;
+	memset(res, 0, sizeof(*res));
+
+	uint32_t total = num_qps * chunks_per_qp;
+	int threads = 64;
+	int blocks = (int)((total + threads - 1) / threads);
+	if (blocks < 1) blocks = 1;
+
+	hipLaunchKernelGGL(oneshot_validate_kernel, dim3(blocks), dim3(threads),
+			   0, 0, (const uint64_t *)markers,
+			   (const uint8_t *)slots, num_qps, chunks_per_qp,
+			   ops_per_chunk, payload_size, lfsr_mode, res);
+	err = hipDeviceSynchronize();
+	if (err != hipSuccess) {
+		fprintf(stderr, VALIDATION_LOG_PREFIX
+			" rocm: one-shot kernel failed: %s\n",
+			hipGetErrorString(err));
+		(void)hipFree(res);
+		return -1;
+	}
+
+	if (chunks)  *chunks  = res->chunks;
+	if (bytes)   *bytes   = res->bytes;
+	if (errors)  *errors  = res->errors;
+	if (no_lock) *no_lock = res->no_lock;
+	if (err_chunk)    *err_chunk    = (uint32_t)res->first_chunk;
+	if (err_off)      *err_off      = res->first_off;
+	if (err_expected) *err_expected = (uint8_t)res->first_expected;
+	if (err_actual)   *err_actual   = (uint8_t)res->first_actual;
+
+	(void)hipFree(res);
+	return 0;
+}
+
 extern "C" int rocm_kernels_available(void)
 {
 	int count = 0;
