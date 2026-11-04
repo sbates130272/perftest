@@ -25,8 +25,8 @@ jobs:
       # cancelling the others hides exactly the comparison that would say so.
       fail-fast: false
       matrix:
-        # gfx950 (CDNA, Instinct) and gfx1250 (RDNA) differ in wavefront width
-        # among other things, which the HIP sources have to get right.
+        # gfx950 (Instinct MI355X, CDNA4) and gfx1250 (Instinct MI455X, CDNA5)
+        # cover consecutive Instinct generations.
         rocm_arch: [gfx950, gfx1250]
 
     name: ROCm (${{ matrix.rocm_arch }})
@@ -72,18 +72,8 @@ jobs:
 
       - name: Configure the build
         run: |
-          # --with-rocm-arch selects the GPU the HIP kernels are compiled for.
-          # It only exists once there are HIP sources to compile, so probe for
-          # it rather than passing it blind: configure treats an unknown
-          # --with-* as a warning, which would silently do nothing here.
-          # Until such sources exist the two matrix legs build the same thing;
-          # they diverge as soon as there is device code to generate.
-          ROCM_ARCH_OPT=""
-          if ./configure --help | grep -q -- --with-rocm-arch; then
-            ROCM_ARCH_OPT="--with-rocm-arch=${{ matrix.rocm_arch }}"
-          fi
           ./configure --enable-rocm --enable-rocm-dmabuf \
-                      --with-rocm="$ROCM_PATH" $ROCM_ARCH_OPT
+                      --with-rocm="$ROCM_PATH"
 
       - name: Build perftest
         run: make
